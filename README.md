@@ -4,9 +4,38 @@ dacjames' Claude Code plugin marketplace.
 
 ## Install
 
+Add the marketplace, then install the plugin:
+
 ```
 /plugin marketplace add dacjames/dacetplace
 /plugin install dacbots@dacetplace
+```
+
+To hack on the plugins locally, add the marketplace by **path** instead of
+`owner/repo` — that points Claude Code at your working tree, so local edits are
+picked up without a push:
+
+```
+/plugin marketplace add /path/to/dacetplace
+/plugin install dacbots@dacetplace
+```
+
+After editing a skill, refresh with `/plugin marketplace update dacetplace`.
+Browse and manage everything with `/plugin`. Remove with
+`/plugin marketplace remove dacetplace`.
+
+## Usage
+
+Each skill is `user-invocable`, so it shows up as a slash command once installed.
+Run a skill with no args to auto-detect the repo's toolchain, or pass names to
+force a ruleset.
+
+```
+/dev-permissions              # detect toolchain, write safe auto-approval rules
+/dev-permissions go python    # force the go + python rulesets
+
+/dev-tasks                    # detect toolchain, scaffold a Taskfile.yml
+/dev-tasks go tf              # force the go + terraform namespaces
 ```
 
 ## Plugins
