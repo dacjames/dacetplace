@@ -1,0 +1,6 @@
+{
+  "name": "dacbots",
+  "description": "Secure dev-tool permission setup and project scaffolding skills.",
+  "version": "0.1.0",
+  "author": { "name": "dacjames", "email": "dacjames@gmail.com" }
+}

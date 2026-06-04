@@ -1,0 +1,12 @@
+{
+  "name": "dacetplace",
+  "owner": { "name": "dacjames", "email": "dacjames@gmail.com" },
+  "description": "dacjames' Claude Code plugins.",
+  "plugins": [
+    {
+      "name": "dacbots",
+      "source": "./plugins/dacbots",
+      "description": "Secure dev-tool permission setup and project scaffolding skills."
+    }
+  ]
+}

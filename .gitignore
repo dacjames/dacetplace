@@ -1,0 +1,12 @@
+# Scratch dirs
+tmp/
+wip/
+wip:/
+scratch/
+
+# Claude Code local
+.claude/settings.local.json
+.claude/worktrees/
+
+# OS
+.DS_Store
