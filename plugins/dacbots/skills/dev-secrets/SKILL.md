@@ -36,9 +36,9 @@ GHA/terraform opt-in).
    entries are tracked. Secret file contents stay local + gitignored.
 2. **Manifest is the source of truth.** Download reads it; upload rewrites it.
    It is the name↔file map (GCP secret names disallow dots/slashes).
-3. **`:`-nested, `ask:`-gated task names** (go-task house convention, see
+3. **`:`-nested, `:ask`-gated task names** (go-task house convention, see
    `/dev-tasks`). Upload/download touch the cloud and write plaintext secrets
-   locally, so both are `ask:`-prefixed and gated by a permission rule.
+   locally, so both are `:ask`-suffixed and gated by a permission rule.
 4. **Adapt naming to the runner.** Colons where the runner allows them
    (go-task, npm), hyphens where it doesn't (make), files for shell.
 5. **Idempotent + preserve.** Merge into existing files (gitignore, manifest,
@@ -89,14 +89,14 @@ Prefer **go-task**. Detect in order:
 
 If **none found**, ask the user which to install. On yes, **invoke `/dev-tasks`**
 to scaffold a convention-compliant `Taskfile.yml`, then add the secrets tasks to
-it. (`/dev-tasks` also installs the `Bash(task ask:*)` gate this skill relies
+it. (`/dev-tasks` also installs the `Bash(task *:ask)` gate this skill relies
 on.)
 
 Adapt the `a:b:c` convention to the runner:
 
 | Runner | upload | download | gated form |
 |--------|--------|----------|------------|
-| go-task | `secrets:upload` | `secrets:download` | `ask:secrets:upload` |
+| go-task | `secrets:upload` | `secrets:download` | `secrets:upload:ask` |
 | npm | `secrets:upload` | `secrets:download` | (gate via `ask` perm rule) |
 | make | `secrets-upload` | `secrets-download` | `ask-secrets-upload` |
 | shell | `scripts/secrets-upload.sh` | `scripts/secrets-download.sh` | — |
@@ -128,12 +128,12 @@ found).
 
 ### 5. Generate upload/download tasks
 
-Emit into the detected runner, `ask:`-gated. go-task shape (adapt per the table
+Emit into the detected runner, `:ask`-gated. go-task shape (adapt per the table
 in step 3); substitute `<id>` with the project from step 2 and `<dir>` with the
 secrets dir:
 
 ```yaml
-  ask:secrets:upload:
+  secrets:upload:ask:
     desc: Upload all secret files to GCP Secret Manager (ai-ask gated)
     cmds:
       - |
@@ -149,7 +149,7 @@ secrets dir:
           grep -q " $f$" <dir>/manifest.txt || echo "$name $f" >> <dir>/manifest.txt
         done
 
-  ask:secrets:download:
+  secrets:download:ask:
     desc: Download all secrets from GCP Secret Manager into the secrets dir (ai-ask gated)
     cmds:
       - mkdir -p <dir>
@@ -170,7 +170,7 @@ shell cleanly). For **shell**, write `scripts/secrets-upload.sh` /
 **Permission gating** — merge into `.claude/settings.local.json` (read existing,
 create if missing, dedupe, preserve all other keys, write valid JSON):
 
-- go-task: `permissions.ask` += `Bash(task ask:*)` (already present if
+- go-task: `permissions.ask` += `Bash(task *:ask)` (already present if
   `/dev-tasks` or `/dev-permissions` ran — then nothing to add).
 - make: `permissions.ask` += `Bash(make ask-secrets-upload)` +
   `Bash(make ask-secrets-download)` (make has no prefix glob convention).
@@ -207,7 +207,7 @@ terraform secrets. On yes:
   env's other vars.
 - The secret tfvars must be:
   1. **Passed to terraform/opentofu tasks** via `-var-file=<…>.secret.tfvars`.
-     Harmonize the existing `ask:tf:*` tasks from `/dev-tasks` (per env) to
+     Harmonize the existing `tf:*:ask` tasks from `/dev-tasks` (per env) to
      thread the flag; if those tasks don't exist, note it and add the flag where
      the project invokes terraform/tofu.
   2. **Gitignored** — merge `*.secret.tfvars` into `.gitignore`.
@@ -237,8 +237,8 @@ terraform `-var-file` per env) vs. skipped. End with the caveats below.
 - **Download overwrites local files** with the cloud `latest` version —
   uncommitted local edits to secret files are lost. Upload first if local is
   authoritative.
-- **`ask:`-gating is by name prefix only** (go-task). Renaming a task out of the
-  `ask:` prefix silently drops the permission gate — same coupling caveat as
+- **`:ask`-gating is by name suffix only** (go-task). Renaming a task out of the
+  `:ask` suffix silently drops the permission gate — same coupling caveat as
   `/dev-tasks`.
 - **Only GCP is implemented.** AWS / Azure detection hooks exist but their
   command blocks are TODO; the skill will tell you and stop (or proceed

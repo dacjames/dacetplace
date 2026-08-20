@@ -1,6 +1,6 @@
 ---
 name: dev-tasks
-description: Scaffold a convention-compliant go-task Taskfile.yml in a repo. Auto-detects the toolchain (go/terraform/python/node) and emits idempotent, :-nested tasks that are quiet by default, pass through CLI_ARGS, use a local temp dir, and gate ask:/deny:-prefixed tasks behind Claude permission rules. Use when the user wants to set up a Taskfile, add go-task to a project, scaffold dev tasks, or harmonize an existing Taskfile to house conventions. Args: optional toolchain names (go, tf, py, node) to force on demand.
+description: Scaffold a convention-compliant go-task Taskfile.yml in a repo. Auto-detects the toolchain (go/terraform/python/node) and emits idempotent, :-nested tasks that are quiet by default, pass through CLI_ARGS, use a local temp dir, and gate :ask/:deny-suffixed tasks behind Claude permission rules. Use when the user wants to set up a Taskfile, add go-task to a project, scaffold dev tasks, or harmonize an existing Taskfile to house conventions. Args: optional toolchain names (go, tf, py, node) to force on demand.
 user-invocable: true
 allowed-tools:
   - Read
@@ -14,8 +14,8 @@ allowed-tools:
 
 Writes (or harmonizes) a [go-task](https://taskfile.dev) `Taskfile.yml` that
 follows house conventions: idempotent tasks, `:`-nested names, quiet by default,
-`CLI_ARGS` passthrough, a local temp dir, full command output, and `ask:`/`deny:`
-prefixes wired to Claude permission rules.
+`CLI_ARGS` passthrough, a local temp dir, full command output, and `:ask`/`:deny`
+suffixes wired to Claude permission rules.
 
 Arguments: `$ARGUMENTS` — optional space-separated toolchains to force:
 `go`, `tf`, `py`, `node`. With no args, detect the toolchain from repo manifests.
@@ -27,7 +27,7 @@ Arguments: `$ARGUMENTS` — optional space-separated toolchains to force:
 1. **Idempotent.** Every task is safe to run repeatedly. `mkdir -p`, append-only
    guards (`grep -qxF ... || echo ...`), `rm -rf` against known paths, etc.
 2. **`:`-nested names.** Use `:` for nesting: `go:setup`, `test:e2e-suite-1`,
-   `ssh:canary:us-west2`, `ask:tf:apply`. go-task allows `:` directly in task
+   `ssh:canary:us-west2`, `tf:apply:ask`. go-task allows `:` directly in task
    names — a single flat `Taskfile.yml` is the default. (For large repos,
    `includes:` to per-namespace Taskfiles is an option; mention but don't force.)
 3. **`CLI_ARGS` passthrough.** Run/test-style tasks thread `{{.CLI_ARGS}}` so
@@ -43,7 +43,7 @@ Arguments: `$ARGUMENTS` — optional space-separated toolchains to force:
    `TMP` var; provision the dir via a `tmp:setup` task (create + gitignore).
 7. **`default` lists tasks** (`task --list`); **every task has a `desc:`** so it
    shows up in the listing.
-8. **`ask:` / `deny:` prefixes** mark tasks gated by `task ask:*` / `task deny:*`
+8. **`:ask` / `:deny` suffixes** mark tasks gated by `task *:ask` / `task *:deny`
    permission rules (written in step 5).
 
 ---
@@ -128,11 +128,11 @@ tasks:
     desc: Remove Go build artifacts
     cmds: [rm -rf {{.TMP}}/build]
 
-  # --- ai-gated tasks (prefix → permission rule, see step 5) ---
-  ask:tf:apply:
+  # --- ai-gated tasks (suffix → permission rule, see step 5) ---
+  tf:apply:ask:
     desc: Apply terraform/opentofu (ai-ask gated)
     cmds: ['tofu apply {{.CLI_ARGS}}']
-  deny:tf:init-upgrade:
+  tf:init-upgrade:deny:
     desc: terraform/opentofu init -upgrade (ai-deny gated)
     cmds: [tofu init -upgrade]
 ```
@@ -161,8 +161,8 @@ If `Taskfile.yml` already exists, **do not overwrite it.** Read it, then:
 Merge into `.claude/settings.local.json` (read existing, create if missing,
 dedupe, preserve all other keys, write valid JSON):
 
-- `permissions.ask`: `Bash(task ask:*)`
-- `permissions.deny`: `Bash(task deny:*)`
+- `permissions.ask`: `Bash(task *:ask)`
+- `permissions.deny`: `Bash(task *:deny)`
 
 Precedence is **deny → ask → allow**, first match wins, so these override the
 broad `Bash(task:*)` allow (installed by `/dev-permissions` base ruleset). If
@@ -183,9 +183,9 @@ rules added vs. already present.
 - **`silent` ≠ hiding output.** `silent: true` suppresses go-task's command
   *echo*, not the program's stdout/stderr. Full output still shows — that's
   intended. Do not "fix" noisy tasks with `/dev/null` redirects.
-- **Prefix-to-permission coupling is by convention.** `ask:`/`deny:` only gate if
-  the task name actually starts with that prefix and the matching `Bash(task
-  ask:*)` / `Bash(task deny:*)` rule exists. Renaming a task out of the prefix
+- **Suffix-to-permission coupling is by convention.** `:ask`/`:deny` only gate if
+  the task name actually ends with that suffix and the matching `Bash(task
+  *:ask)` / `Bash(task *:deny)` rule exists. Renaming a task out of the suffix
   silently removes the gate.
 - **`:` in names vs. includes.** Flat colon-named tasks live in one file and are
   the default. If the repo later splits into `includes:`, namespace prefixes are

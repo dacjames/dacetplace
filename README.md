@@ -50,5 +50,5 @@ Secure dev-tool permission setup and project scaffolding skills.
 | Skill | Description |
 |-------|-------------|
 | `dev-permissions` | Writes curated auto-approval rules to `.claude/settings.local.json` (allow/ask/deny) and fs-navigation rules to `CLAUDE.md`. Detects toolchain or takes ruleset args (`go`, `node`, `python`, `rust`). |
-| `dev-tasks` | Scaffolds a convention-compliant go-task `Taskfile.yml`: idempotent, `:`-nested, quiet-by-default, `CLI_ARGS` passthrough, local temp dir, `ask:`/`deny:`-prefixed tasks gated by permission rules. Detects toolchain or takes args (`go`, `tf`, `py`, `node`). |
+| `dev-tasks` | Scaffolds a convention-compliant go-task `Taskfile.yml`: idempotent, `:`-nested, quiet-by-default, `CLI_ARGS` passthrough, local temp dir, `:ask`/`:deny`-suffixed tasks gated by permission rules. Detects toolchain or takes args (`go`, `tf`, `py`, `node`). |
 | `dev-secrets` | Wires `secrets:upload` / `secrets:download` tasks (GCP Secret Manager) into the repo's task runner — adapts the `:`-naming to go-task/make/npm/shell. Committed name-manifest, gitignored values. Optional GitHub Actions download step and `*.secret.tfvars` terraform support (per-env, gitignored, round-tripped). Detects backend/runner or takes args (`gcp`, `task`, `make`, `npm`, `shell`). |

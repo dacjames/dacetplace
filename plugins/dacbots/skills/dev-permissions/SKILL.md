@@ -153,12 +153,12 @@ Bash(git rebase:*)
 Bash(git cherry-pick:*)
 Bash(git push --force*)
 Bash(git reset --hard:*)
-Bash(task ask:*)
+Bash(task *:ask)
 ```
 
 `deny` (unambiguous `cd` escapes — no collision with legitimate project paths):
 ```
-Bash(task deny:*)
+Bash(task *:deny)
 Bash(cd ..)
 Bash(cd ../*)
 Bash(cd ~)
