@@ -11,16 +11,16 @@
 # version:, silent:, default and test come from the base Taskfile (see
 # /dev-tasks) -- do not copy this file in place of Taskfile.yml.
 #
-# Ten placeholder tokens (each spelled DEV_TF_<NAME> wrapped in double
+# Eight placeholder tokens (each spelled DEV_TF_<NAME> wrapped in double
 # underscores) must be replaced before this is usable; see dev-tf/SKILL.md
 # step 6. Grep the double-underscore DEV_TF prefix afterwards -- a survivor
 # is an incomplete install. This banner deliberately does not spell the
 # prefix out, so that grep stays clean once the banner is dropped.
 #
 # Sections marked CONDITIONAL below are only spliced in when they apply:
-# tf:setup / tf:setup:all ship for gcs and local backends only: every other
-# tf:* task is backend-agnostic, because init only ever passes
-# -backend-config=<file> through. tf:toolchain:show / :install / :use:ask
+# tf:setup / tf:setup:all ship for a gcs backend only, the one tf_setup
+# provisions: every other tf:* task is backend-agnostic, because init only
+# ever passes -backend-config=<file> through. tf:toolchain:show / :install / :use:ask
 # ship only for a repo that genuinely runs two toolchains; a single-toolchain
 # repo hardcodes TF and drops them, but keeps the tf:toolchain:assert:tofu
 # guard below -- it ships even when TF is hardcoded.
@@ -40,38 +40,36 @@ env:
 # key. A variable the script needs must be added to both vars: below and
 # this anchor, or the script silently reads an empty string.
 tf_stack_env: &tf_stack_env
+  V_BOOTSTRAP_PROJECT: "{{.BOOTSTRAP_PROJECT}}"
   V_ROOT_DIR: "{{.ROOT_DIR}}"
   V_TMP: "{{.TMP}}"
   V_TF: "{{.TF}}"
   V_TF_VERSION: "{{.TF_VERSION}}"
-  V_TF_BACKEND: "{{.TF_BACKEND}}"
-  V_STATE_PROJECT: "{{.STATE_PROJECT}}"
   V_LOCK_STASH: "{{.LOCK_STASH}}"
-  V_PLUGIN_CACHE: "{{.PLUGIN_CACHE}}"
-  V_STACKS_DIR: "{{.STACKS_DIR}}"
   V_STACK: "{{.STACK}}"
   V_STACK_DIR: "{{.STACK_DIR}}"
   V_STACKS: "{{.STACKS}}"
   V_ENV_FILE: "{{.ENV_FILE}}"
   V_USE_VARS: "{{.USE_VARS}}"
   V_USE_BACKEND: "{{.USE_BACKEND}}"
-  V_VARS: "{{.VARS}}"
-  V__VARS: "{{._VARS}}"
-  V_VARS_ID: "{{.VARS_ID}}"
-  V_VARS_RESOLVED: "{{.VARS_RESOLVED}}"
-  V_VARS_MAP: "{{.VARS_MAP}}"
   V_BACKEND: "{{.BACKEND}}"
   V__BACKEND: "{{._BACKEND}}"
   V_BACKEND_ID: "{{.BACKEND_ID}}"
   V_BACKEND_FILE: "{{.BACKEND_FILE}}"
   V_BACKEND_MAP: "{{.BACKEND_MAP}}"
   V_BACKEND_RESOLVED: "{{.BACKEND_RESOLVED}}"
+  V_VARS: "{{.VARS}}"
+  V__VARS: "{{._VARS}}"
+  V_VARS_ID: "{{.VARS_ID}}"
+  V_VARS_RESOLVED: "{{.VARS_RESOLVED}}"
+  V_VARS_MAP: "{{.VARS_MAP}}"
   V_DATA_DIR: "{{.DATA_DIR}}"
   V_PLAN_FILE: "{{.PLAN_FILE}}"
 
 vars:
   # -- globals -- #
   TMP: '__DEV_TF_TMP__'
+  BOOTSTRAP_PROJECT: '__DEV_TF_BOOTSTRAP_PROJECT__'
 
   # common tf configs
   TF: '__DEV_TF_TF__'
@@ -79,26 +77,20 @@ vars:
   # the whole tf:toolchain:* conditional block below for a tofu-only repo
   # and this var goes unused, which is harmless.
   TF_VERSION: '__DEV_TF_TF_VERSION__'
-  TF_BACKEND: '__DEV_TF_BACKEND__'
-  STATE_PROJECT: '__DEV_TF_STATE_PROJECT__'
   LOCK_STASH: '{{.ROOT_DIR}}/{{.TMP}}/locks'
   PLUGIN_CACHE: '{{.ROOT_DIR}}/{{.TMP}}/plugin-cache'
   DEBUG_LOG: '{{.ROOT_DIR}}/{{.TMP}}/{{.STACK}}-debug-{{.TF}}.log'
 
-  # tf:setup inputs -- only read for the gcs/local conditional block below
+  # tf:setup inputs -- only read for the gcs conditional block below
   STATE_BUCKET: '__DEV_TF_STATE_BUCKET__'
   STATE_LOCATION: '__DEV_TF_STATE_LOCATION__'
 
   # stack interface: which stack, its dir, and the full list (for the :all
-  # tasks). STACKS_DIR is the one place the stacks/ prefix lives -- STACK_DIR
-  # and the STACKS glob both derive from it, and so does the equivalent glob
-  # inside tf-stack.sh's tf_stacks_list, so changing the layout is a single
-  # var, not three places kept in sync by hand.
-  STACKS_DIR: '__DEV_TF_STACKS_DIR__'
+  # tasks)
   STACK: '{{.STACK | default "main"}}'
-  STACK_DIR: '{{.STACKS_DIR}}/{{.STACK}}'
+  STACK_DIR: 'stacks/{{.STACK}}'
   STACKS:
-    sh: "ls -d {{.STACKS_DIR}}/*/ | sed 's|{{.STACKS_DIR}}/||; s|/$||' | tr '\\n' ' '"
+    sh: "ls -d stacks/*/ | sed 's|stacks/||; s|/$||' | tr '\\n' ' '"
 
   # .env file: tf:use writes VARS/BACKEND here; USE_VARS/USE_BACKEND read
   # them back
@@ -145,12 +137,21 @@ vars:
   # repo actually has -- same rule as VARS_MAP, never copied. Same line
   # shape as VARS_MAP above, and the same whitespace tolerance:
   #   dev:variables/dev.backend.hcl
+  #
+  # A BACKEND path is either a variables/*.backend.hcl (or .tfbackend) handed
+  # to init as -backend-config, or a .tf whose backend block sets the state
+  # location inline -- the layout most terraform repos use. BACKEND_DEFAULT
+  # prefers the .backend.hcl named after the vars_id, falls back to the first
+  # *.tf in the stack with an inline backend, and otherwise keeps naming the
+  # .backend.hcl it looked for, so the asserts can say which file was missing.
+  # A stack whose backends are all inline needs no BACKEND_MAP entry at all.
   BACKEND:
   BACKEND_MAP: |
     __DEV_TF_BACKEND_MAP__
-  BACKEND_DEFAULT: '{{.VARS_ID}}:variables/{{.VARS_ID}}.backend.hcl'
+  BACKEND_DEFAULT:
+    sh: "scripts/tf-stack.sh BACKEND_DEFAULT '{{.STACK_DIR}}' '{{.VARS_ID}}'"
   # backend internals: _BACKEND is the resolved pick; BACKEND_RESOLVED/
-  # BACKEND_FILE expand it to the backend.hcl path (see BACKEND_RESOLVED/
+  # BACKEND_FILE expand it to the backend config path (see BACKEND_RESOLVED/
   # BACKEND_FILE in tf-stack.sh)
   _BACKEND: '{{.BACKEND | default .USE_BACKEND | default .BACKEND_DEFAULT}}'
   BACKEND_ID: '{{._BACKEND | splitList ":" | first | trim}}'
@@ -185,15 +186,9 @@ tasks:
 
   tf:stack:assert:
     internal: true
+    env: *tf_stack_env
     cmds:
-      - |
-        test -f {{.STACK_DIR}}/{{.BACKEND_FILE}} || {
-          echo "stack '{{.STACK}}' has no {{.BACKEND_FILE}} (BACKEND={{._BACKEND}}), so this" >&2
-          echo "run is plan-only. Its state is local and empty: a plan shows every resource" >&2
-          echo "as new even when the resource already exists. Nothing that writes" >&2
-          echo "runs against it. See {{.STACK_DIR}}/README.md." >&2
-          exit 1
-        }
+      - scripts/tf-stack.sh tf_stack_assert
 
   tf:backend:assert:
     internal: true
@@ -261,15 +256,14 @@ tasks:
 
   # ==== END CONDITIONAL: dual-toolchain ==== #
 
-  # ==== CONDITIONAL: gcs and local backends only ==== #
-  # tf_setup is implemented for gcs (idempotent bucket describe-then-create)
-  # and local (mkdir -p its parent dir). For s3 or azurerm, tf_setup prints
-  # the equivalent commands and exits 1 -- provision those out of band and
-  # omit this whole block; every other tf:* task still works, because init
-  # only ever passes -backend-config=<file> through regardless of flavor.
+  # ==== CONDITIONAL: gcs backend only ==== #
+  # tf_setup creates and versions a GCS bucket, and refuses any other backend
+  # type. For a repo on another backend, provision the state store out of
+  # band and omit this whole block; every other tf:* task still works,
+  # because init only ever passes -backend-config=<file> through.
 
   tf:setup:
-    desc: Provision the state BACKEND names, if this backend needs it (idempotent; before tf:init)
+    desc: Create the GCS state bucket BACKEND names, in {{.BOOTSTRAP_PROJECT}} (idempotent; before tf:init)
     silent: false
     env: *tf_stack_env
     cmds:
@@ -287,7 +281,9 @@ tasks:
         set -euo pipefail
         ran=0
         for b in $(printf '%s\n' '{{.BACKEND_MAP}}' | awk -F: '{sub(/^[ \t]+/, "")} NF {print $1}'); do
-          if [ -f "{{.STACK_DIR}}/variables/$b.backend.hcl" ]; then
+          resolved=$(scripts/tf-stack.sh BACKEND_RESOLVED "$b" '{{.BACKEND_MAP}}')
+          file=$(scripts/tf-stack.sh BACKEND_FILE "$resolved")
+          if [ -n "$file" ] && [ "$(scripts/tf-stack.sh BACKEND_KIND "{{.STACK_DIR}}/$file")" != none ]; then
             echo "== $b"
             env -u TF_DATA_DIR task tf:setup STACK={{.STACK}} BACKEND="$b"
             ran=$((ran + 1))
@@ -298,7 +294,7 @@ tasks:
           env -u TF_DATA_DIR task tf:setup STACK={{.STACK}}
         fi
 
-  # ==== END CONDITIONAL: gcs/local ==== #
+  # ==== END CONDITIONAL: gcs ==== #
 
   # ---- init ---- #
 
@@ -331,7 +327,9 @@ tasks:
         set -euo pipefail
         ran=0
         for b in $(printf '%s\n' '{{.BACKEND_MAP}}' | awk -F: '{sub(/^[ \t]+/, "")} NF {print $1}'); do
-          if [ -f "{{.STACK_DIR}}/variables/$b.backend.hcl" ]; then
+          resolved=$(scripts/tf-stack.sh BACKEND_RESOLVED "$b" '{{.BACKEND_MAP}}')
+          file=$(scripts/tf-stack.sh BACKEND_FILE "$resolved")
+          if [ -n "$file" ] && [ "$(scripts/tf-stack.sh BACKEND_KIND "{{.STACK_DIR}}/$file")" != none ]; then
             env -u TF_DATA_DIR task tf:init:once STACK={{.STACK}} BACKEND="$b"
             ran=$((ran + 1))
           fi
@@ -390,7 +388,7 @@ tasks:
       - 'TF_DATA_DIR={{.DATA_DIR_LOCAL}} {{.TF}} validate {{.CLI_ARGS}}'
 
   tf:validate:all:
-    desc: Offline-validate every stack under {{.STACKS_DIR}}/
+    desc: Offline-validate every stack under stacks/
     silent: false
     env: *tf_stack_env
     cmds:

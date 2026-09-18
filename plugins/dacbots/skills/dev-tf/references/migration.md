@@ -1,10 +1,11 @@
 # Migrating an existing Taskfile
 
-This applies whenever `Taskfile.yml` already has `tf:` tasks (mode
-`tf-replace`) or already has other tasks but no `tf:` namespace yet
-(mode `tf-add`). The goal: replace whatever tf tooling exists today with
-the full tf-stack surface, without breaking anything CI actually calls,
-and without moving any stack's state.
+This applies whenever `Taskfile.yml` already has tasks that invoke
+`terraform`/`tofu`, under any name (mode `tf-replace`), or already has
+other tasks but none that do (mode `tf-add`). The goal: replace
+whatever tf tooling exists today with the full tf-stack surface,
+without breaking anything CI actually calls, and without moving any
+stack's state.
 
 ## 1. Discover the CI interface
 
@@ -56,7 +57,7 @@ nothing about what a wrapper task's `cmds:` actually run.
 | `tf:fmt` | `tf:fmt` | already the canonical name | none |
 | `tf:apply` | `tf:apply:ask` | visible wrapper task, `desc: 'CI compat shim for tf:apply:ask -- remove after stabilization'`, `cmds: [{task: tf:apply:ask}]` | `Bash(task tf:apply)` in `permissions.ask` |
 | `tf:destroy` | `tf:destroy:deny` | visible wrapper task, same shape, worded for destroy | `Bash(task tf:destroy)` in `permissions.deny` |
-| `set-env-<env>` | `tf:use STACK=<s> VARS=<env>` | one ungated wrapper task per env running that command | none — writes only a local, gitignored `.env` file |
+| `set-env-<env>` | `tf:use STACK=<s> VARS=<env>` | one ungated wrapper task per env running that command | none — writes only a local, gitignored `<stack>.env` file |
 
 Two shim shapes only, chosen by whether the frozen name **writes**:
 
@@ -73,31 +74,41 @@ Two shim shapes only, chosen by whether the frozen name **writes**:
 
 `set-env-<env>` is neither an alias nor a delegation to a gated task: it
 just writes a `tf:use` selection, which is itself ungated (it only
-writes a gitignored `.env` file, never state), so no rule is added for
-it.
+writes a gitignored `<stack>.env` file, never state), so no rule is
+added for it.
 
 ## 3. Move the layout
 
-Only when root modules are not already under a `stacks/<name>/`-shaped
-directory (or an equivalent parent such as `terraform/`, `infra/`, or
-`live/`). This is a refactor, never a state migration — the checklist
-exists to keep it that way:
+Only when root modules are not already at `stacks/<name>/`. That path is
+hardcoded — `STACK_DIR` is `stacks/{{.STACK}}` and stack discovery globs
+`stacks/*/` — so a repo whose modules sit under `terraform/`, `infra/`,
+or `live/` gets a proposed move into `stacks/`, not a pointer at its
+existing parent. This is a refactor, never a state migration — the
+checklist exists to keep it that way:
 
 1. **List every root module** and its proposed destination. Present the
    full list before moving anything.
 2. **Confirm with the user**, then move **one stack at a time** with
    `git mv`, so history follows the files.
-3. **Keep each backend's `bucket`/`prefix` (or `key`) unchanged.** The
-   directory moves; the state address it points at does not.
+3. **Keep each backend's state address unchanged** — `bucket`/`prefix`,
+   or whichever keys its type names. The directory moves; the state
+   address it points at does not.
 4. **Never delete `.terraform*/` or a local `terraform.tfstate`** as
    part of the move, without asking first — for a local backend, that
    file *is* the state, and for a remote one the cached provider
    directory is expensive but not dangerous to lose, so the two need
    different confirmations.
-5. **Move per-env tfvars into `<stack>/variables/`**, and inline backend
-   settings out of the `.tf` file into `variables/<id>.backend.hcl`,
-   leaving the `.tf` block as a bare `backend "<flavor>" {}`. Ask before
-   rewriting any `.tf` file — this step touches code, not just paths.
+5. **Move per-env tfvars into `<stack>/variables/`.** Extract an inline
+   backend **only when the stack needs more than one environment** —
+   `shape-multi-env` and `shape-multi-both`. A module holds one backend
+   block, so per-environment state means moving the address keys out of
+   the `.tf` into `variables/<id>.backend.hcl` unchanged and leaving the
+   block bare as `backend "<type>" {}`. Ask before rewriting any `.tf`
+   file — this step touches code, not just paths.
+   A single-stack or multi-stack repo **keeps its inline backends as they
+   are**: tf-stack resolves `BACKEND` to the `.tf` and inits without
+   `-backend-config`, so rewriting them changes state configuration for
+   no gain.
 6. **Re-run discovery** (`task tf:stacks:list`, `task tf:vars`) after
    the move and confirm the state string is unchanged from before the
    move, not just present.
@@ -170,8 +181,11 @@ hand-edited copy of the asset — treat it as a bug, not a style choice.
 **Functions dropped from `tf-stack.sh` (5):** `tf_export_show`,
 `tf_export_publish`, `tf_export_query`, `tf_export_query_json`
 (BigQuery publishing), `tf_refresh_diff` (Cloud Asset Inventory-backed
-freshness checking). None of the surviving 21 functions call these, and
-none of the surviving `tf:*` tasks depend on them.
+freshness checking). None of the surviving 31 functions call these, and
+none of the surviving `tf:*` tasks depend on them. That strip is the
+only transformation: `assets/tf-stack.sh` is the source repo's
+`scripts/tf-stack.sh` with those five functions removed and nothing
+else changed, so 31 of its 36 functions survive byte for byte.
 
 **Tasks dropped (21), by group:**
 
@@ -190,18 +204,21 @@ none of the surviving `tf:*` tasks depend on them.
 `projects:`, and any per-repro debug namespace. None of these are part
 of tf-stack; they belonged to the source repo's own infrastructure.
 
-**Top-level `test` task:** trimmed to depend only on
-`tf:fmt:check:all` and `tf:validate:all` — the offline tf checks. The
+**Top-level `test` task:** the fragment ships none — `test` comes from
+the base Taskfile, and should depend only on `tf:fmt:check:all` and
+`tf:validate:all` for the tf side — the offline tf checks. The
 source's `test` also depended on `org:test`, `tf:export:test`, and
 `tf:refresh-diff:test`, all of which tested namespaces this skill does
 not ship.
 
-**Anchor keys dropped:** the `tf_stack_env` anchor carries only the keys
-the 21 surviving functions read. Dropped: `V_ORG_ID`,
-`V_REFRESH_DIFF_DIR`, `V_REFRESH_DIFF_TYPES`, `V_VAR_FILES` (all read
-only by `tf_refresh_diff`), and `V_BOOTSTRAP_PROJECT` (renamed
-`V_STATE_PROJECT` for the surviving gcs-only use, so it does not carry
-the old key's association with one specific bootstrap project).
+**Anchor keys dropped:** the `tf_stack_env` anchor carries the keys the
+31 surviving functions read, plus `V_ROOT_DIR` for the repo root.
+Dropped: `V_ORG_ID`, `V_PLUGIN_CACHE`, `V_REFRESH_DIFF_DIR`,
+`V_REFRESH_DIFF_TYPES`, `V_VAR_FILES` — each read only by a dropped
+function or a dropped namespace. Every key that stays
+keeps its source spelling, `V_BOOTSTRAP_PROJECT` included: it names the
+project that owns the state bucket, which is what `tf_setup` still reads
+it for.
 
 **Values that never appear, in assets or in any target repo** — verify
 absence with `git grep -n '<term>'` after any install:

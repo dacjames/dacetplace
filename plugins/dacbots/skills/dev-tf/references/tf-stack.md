@@ -25,10 +25,10 @@ What it adds:
   saved plan file by stack, vars, backend and toolchain — so planning prod
   after dev cannot leave `apply` holding the wrong plan.
 
-Needs [go-task](https://taskfile.dev) and `tofu`. Nothing else for a
-`local` backend; `gcloud`, `aws` or `az` only for the backend flavor
-you use (`tf:setup`); `terraform` + `tfenv` only if you want the
-plan-only second toolchain.
+Needs [go-task](https://taskfile.dev) and `tofu`. Nothing else to plan or
+apply against a state store that already exists; `gcloud` only if this
+repo carries the `tf:setup` tasks that create its GCS state buckets;
+`terraform` + `tfenv` only if you want the plan-only second toolchain.
 
 ## Arguments go after the task name
 
@@ -64,10 +64,10 @@ VARS       dev                                 BACKEND    dev:variables/dev.back
 RESOLVED   dev:variables/common.tfvars,…       SOURCE     VARS_ID=dev
 VARS_ID    dev                                 BACKEND_ID dev
 BACKEND    dev                                 FILE       …/variables/dev.backend.hcl
-PLAN       …/app-dev-dev-tofu.tfplan           STATE      gs://…-tfstate-dev/app
-FILES                                          WRITABLE   yes
-  variables/common.tfvars                      DATA_DIR   …/.terraform-tofu-dev
-  variables/dev-extra.tfvars
+PLAN       …/app-dev-dev-tofu.tfplan           FORMAT     backend config, …
+FILES                                          STATE      gs://…-tfstate-dev/app
+  variables/common.tfvars                      WRITABLE   yes
+  variables/dev-extra.tfvars                   DATA_DIR   …/.terraform-tofu-dev
   variables/dev.tfvars
 ```
 
@@ -85,8 +85,9 @@ task tf:plan:all  STACK=app                     # one plan per name in VARS_MAP
 ### The three selectors
 
 **`STACK`** is the root module directory — `STACK=app` means `stacks/app/`,
-and every `tf:*` task runs with that as its working directory, so all
-paths in `VARS` and `BACKEND` are **stack-relative**. Defaults to `main`.
+and every `tf:*` task that reaches tofu runs with that as its working
+directory, so all paths in `VARS` and `BACKEND` are **stack-relative**.
+Defaults to `main`.
 
 **`VARS`** selects tfvars, in two equivalent forms — `VARS=<vars_id>`,
 looked up in `VARS_MAP`, or `VARS=<vars_id>:<glob>[,<glob>...]` spelled
@@ -168,7 +169,7 @@ One root module, one environment, one state — the default everything.
 ```
 stacks/main/
   main.tf  variables.tf  outputs.tf  versions.tf
-  backend.tf                         # terraform { backend "<flavor>" {} }
+  backend.tf                         # terraform { backend "<type>" {} }
   variables/
     main.tfvars                      # matches the default VARS
     main.backend.hcl                 # matches the default BACKEND
@@ -179,6 +180,11 @@ stacks/main/
 no arguments and neither map needs an entry. Growing a second environment
 later is additive: write the tfvars, add a `VARS_MAP` line, and commands
 gain a `VARS=` argument.
+
+A single module that instead writes its bucket and prefix straight into
+`backend "<type>" { … }` needs no `main.backend.hcl` and no
+`backend.tf` — see [the two places a backend
+lives](#the-two-places-a-backend-lives) below. Nothing else changes.
 
 ### Multi-stack
 
@@ -193,8 +199,9 @@ stacks/
   edge/    # not provisioned yet
 ```
 
-Each has its own `variables/<stack>.tfvars` and
-`variables/<stack>.backend.hcl`, so each gets its own state prefix,
+Each has its own `variables/<stack>.tfvars` and its own backend — a
+`variables/<stack>.backend.hcl`, or the location inline in its own `.tf`,
+whichever the stack already uses — so each gets its own state prefix,
 `TF_DATA_DIR` and plan file:
 
 ```
@@ -203,15 +210,44 @@ task tf:stacks:list        # every stack, its backends, where each one's state l
 task tf:validate:all       # offline-validate every stack
 ```
 
-`backend.tf` in each stack is a bare `backend "<flavor>" {}` — bucket and
-prefix (or key) come from `-backend-config`, which is what makes the same
-root module reusable across backends.
+`backend.tf` in each stack is a bare `backend "<type>" {}` — bucket and
+prefix come from `-backend-config`, which is what lets one root module
+serve every environment's state.
 
-**A stack with no `backend.hcl` is plan-only**, shown as `WRITABLE no`.
-Its state is local and empty, so a plan shows every resource as new, and
-every writing task refuses to run against it. That is a deliberate mode:
-it is how a stack that duplicates resources another stack already owns
-is kept harmless while it is being adopted.
+### The two places a backend lives
+
+A `BACKEND` path is one of two things, and tf-stack reads both:
+
+- **A backend config file** — `variables/<id>.backend.hcl` (or
+  `.tfbackend`), handed to `init` as `-backend-config`. The `.tf` holds a
+  bare `backend "<type>" {}` to receive it. One file per environment,
+  which is what makes per-environment state possible.
+- **An inline backend** — a `backend "<type>" { … }` block in one of the
+  stack's own `.tf` files, with the location written into it. This is the
+  layout most terraform repos use. The stack then needs no `.backend.hcl`:
+  `BACKEND` defaults to the first `*.tf` with such a block, `init` runs
+  without `-backend-config`, and `tf:stacks:list` / `tf:backend` read the
+  location straight out of the block. Pin it with `BACKEND=<id>:main.tf`
+  if you would rather state it than derive it.
+
+`task tf:backend` prints which one is in play on its `FORMAT` line. Its
+`STATE` line — the same value `tf:stacks:list` shows — is
+`gs://<bucket>/<prefix>` for a gcs backend, `<type> backend` for an inline
+block of any other type, and `local, plan-only` when there is none; a
+`.backend.hcl` names no type, so one configuring something other than gcs
+is still reported as gcs.
+
+An **empty** `backend "<type>" {}` is not an inline backend — it is the
+partial-config form, and its settings still have to arrive from a
+`.backend.hcl`. One backend block per root module, so per-environment
+state means the `.backend.hcl` form.
+
+**A stack with no backend config at all — no `backend.hcl` and no inline
+block — is plan-only**, shown as `WRITABLE no`. Its state is local and
+empty, so a plan shows every resource as new, and every writing task
+refuses to run against it. That is a deliberate mode: it is how a stack
+that duplicates resources another stack already owns is kept harmless
+while it is being adopted.
 
 ### Multi-env
 
@@ -237,7 +273,7 @@ stacks/app/
 ```
 
 with the environments named in both maps (`VARS_MAP` as above,
-`BACKEND_MAP` mapping each id to its `.backend.hcl`). Four choices in
+`BACKEND_MAP` mapping each id to its `.backend.hcl`). Three choices in
 there are load-bearing:
 
 - **No `app.tfvars` and no `app.backend.hcl`, on purpose** — rule 1 above.
@@ -340,13 +376,19 @@ Read-only. Use before anything that writes.
 
 | Task | What it does |
 | --- | --- |
-| `tf:setup` | Provision the state backend `BACKEND` names. Idempotent for `gcs` and `local`; for other flavors it prints the keys found and exits — see the backends reference |
+| `tf:setup` | Create and version the GCS bucket `BACKEND` names — or `STATE_BUCKET` under a prefix of the stack's own, for a stack with no backend config yet. Idempotent, and read-only against a bucket that already exists and is versioned |
 | `tf:setup:all` | `tf:setup` once per backend the stack actually has |
 | `tf:init:once` | Init unless `TF_DATA_DIR` already exists. Most plan/apply tasks depend on this |
 | `tf:init:init` | Init unconditionally; retries with `-reconfigure` if the backend cache is stale |
 | `tf:init:once:all` | `tf:init:once` for every backend the stack has |
 | `tf:init:local` | Init with `-backend=false` into a separate data dir. Offline, no credentials |
 | `tf:init:upgrade:ask` | Re-init with `-upgrade`, rewriting the lock file |
+
+`tf:setup` creates GCS buckets and nothing else, so it and `tf:setup:all`
+are only present in a repo whose state lives in GCS; elsewhere the state
+store is provisioned out of band and these two tasks are absent. Every
+other `tf:*` task is indifferent to the backend, because `init` only
+passes `-backend-config=<file>` through.
 
 ### `tf:fmt:*`, `tf:validate:*` — checks
 
@@ -357,6 +399,7 @@ Read-only. Use before anything that writes.
 | `tf:validate` | `validate` against the real backend (inits first) |
 | `tf:validate:local` | `validate` offline — no backend, no credentials |
 | `tf:validate:all` | Offline-validate every stack under `stacks/` |
+| `tf:verify` | Offline self-check of the install — scripts, tasks, maps and guards. `-- --offline` skips the two that run tofu |
 
 `task test` runs `tf:fmt:check:all` and `tf:validate:all` — the offline
 check set.
@@ -382,8 +425,9 @@ a bug report.
 
 ### Write tasks
 
-Each refuses first if the stack is plan-only, if `TF` is not `tofu`, or
-if `VARS` does not resolve.
+`tf:apply:ask`, `tf:refresh:ask` and `tf:destroy:deny` each refuse first
+if the stack is plan-only, if `TF` is not `tofu`, or if `VARS` does not
+resolve. `tf:output` and `tf:clean` are ungated.
 
 | Task | What it does |
 | --- | --- |
@@ -403,8 +447,8 @@ recovery is in the error.
 | Guard | Refuses when | Because |
 | --- | --- | --- |
 | `tf:vars:assert` | `VARS` names nothing in `VARS_MAP`, or a glob matches no file | tofu treats a missing `-var-file` as fine and plans from variable defaults |
-| `tf:backend:assert` | `BACKEND` resolves to no `backend.hcl` that exists | otherwise tofu says `bucket must be set` — true, and silent about what was missing |
-| `tf:stack:assert` | a writing task targets a stack with no backend file | its state is local and empty; an apply would create a second copy of resources another stack owns |
+| `tf:backend:assert` | `BACKEND` resolves to no backend config that exists — no `backend.hcl`, no `.tf` with an inline backend block | otherwise tofu says `bucket must be set` — true, and silent about what was missing |
+| `tf:stack:assert` | a writing task targets a stack with no backend config of either form | its state is local and empty; an apply would create a second copy of resources another stack owns |
 | `tf:toolchain:assert:tofu`\* | a writing task runs under `TF=terraform` | both toolchains share one remote state |
 
 \* named `tf:toolchain:assert:terraform` in a terraform-only repo — the
@@ -413,8 +457,9 @@ purpose is "one toolchain writes", named after whichever one that is.
 ## Local state
 
 Everything tf-stack writes locally is gitignored: the configured `TMP`
-dir (plan files, state dumps, stashed locks, plugin cache),
+dir (plan files, the debug log, stashed locks, plugin cache),
 `.terraform-*/` (per-toolchain, per-backend working directories),
 `<stack>.env` (written by `tf:use`), and `.terraform.lock.hcl`. `task
-tf:clean` removes all of it for a stack; `task tmp:setup` recreates the
-temp dir and is already a dependency of every task that needs it.
+tf:clean` removes all of it for a stack except `<stack>.env`, which
+`tf:use:clear` drops; `task tmp:setup` recreates the temp dir and is
+already a dependency of every task that needs it.

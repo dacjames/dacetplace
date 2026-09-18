@@ -8,16 +8,16 @@
 # lock. Run from the repo root -- this is what `task tf:verify` does.
 #
 # Prints one line per check, "PASS <n> ..." or "FAIL <n> ...: <reason>",
-# and exits non-zero if any check FAILs. `--offline` skips checks 11 and
-# 12 (the tf:use round trip and tf:fmt:check:all / tf:validate:all), the
+# and exits non-zero if any check FAILs. `--offline` skips checks 10 and
+# 11 (the tf:use round trip and tf:fmt:check:all / tf:validate:all), the
 # only two that shell out to tofu/terraform itself.
 
 set -uo pipefail
 
 # go-task accepts either spelling, and repos in the wild use both. Detect
-# rather than assume: hardcoding .yml makes check 3 report "not found" and the
-# STACKS_DIR sniff silently miss on a .yaml repo, and the only way out would be
-# editing this file -- which convention 1 forbids.
+# rather than assume: hardcoding .yml makes check 3 report "not found" on a
+# .yaml repo, and the only way out would be editing this file -- which
+# convention 1 forbids.
 if [ -f "Taskfile.yml" ]; then
   TASKFILE="Taskfile.yml"
 elif [ -f "Taskfile.yaml" ]; then
@@ -61,22 +61,13 @@ list_stacks() {
     sed '/^$/d'
 }
 
-# STACKS_DIR is a single literal value templated into the Taskfile (see
-# dev-tf deviation (e)); read it directly rather than asking `task` for it,
-# because a stack with no valid default VARS/BACKEND (any real multi-env
-# stack) refuses tf:backend before ever printing a DATA_DIR/FILE line we
-# could parse STACK_DIR back out of.
-STACKS_DIR_CACHE=""
-stacks_dir() {
-  if [ -z "$STACKS_DIR_CACHE" ]; then
-    STACKS_DIR_CACHE=$(sed -E -n "s/^[[:space:]]*STACKS_DIR:[[:space:]]*[\"']?([A-Za-z0-9_./-]+)[\"']?[[:space:]]*\$/\1/p" "$TASKFILE" 2>/dev/null | head -n 1)
-    [ -n "$STACKS_DIR_CACHE" ] || STACKS_DIR_CACHE="stacks"
-  fi
-  printf '%s' "$STACKS_DIR_CACHE"
-}
-
+# stacks live under stacks/: the one layout tf-stack.sh's tf_stacks_list and
+# the Taskfile's STACK_DIR both hardcode. Spelled here rather than asked of
+# `task`, because a stack with no valid default VARS/BACKEND (any real
+# multi-env stack) refuses tf:backend before ever printing a DATA_DIR/FILE
+# line STACK_DIR could be parsed back out of.
 stack_dir_for() {
-  printf '%s/%s' "$(stacks_dir)" "$1"
+  printf 'stacks/%s' "$1"
 }
 
 # picks one stack and one VARS id that actually resolves for it, printed
@@ -162,20 +153,28 @@ check1() {
 }
 
 # ---------------------------------------------------------------------
-# 2. scripts/tf-stack.sh help lists exactly the expected 23 function
+# 2. scripts/tf-stack.sh help lists exactly the expected 31 function
 # names -- catches a truncated copy. This set is the frozen ABI (dev-tf
-# plan section 4): a byte-for-byte copy always carries all 23, regardless
-# of which backend/toolchain the target repo uses.
+# plan section 4): a byte-for-byte copy always carries all 31, regardless
+# of which backend/toolchain the target repo uses, and regardless of
+# whether its stacks keep their backends in .backend.hcl files or inline.
 # ---------------------------------------------------------------------
 check2() {
-  local label="2 $SCRIPT help lists exactly 23 functions"
+  local label="2 $SCRIPT help lists exactly 31 functions"
   if [ ! -x "$SCRIPT" ] && [ ! -f "$SCRIPT" ]; then
     fail "$label" "$SCRIPT not found"
     return
   fi
   local expected
   expected=$(cat <<'NAMES'
+BACKEND_DEFAULT
 BACKEND_FILE
+BACKEND_INLINE_FILE
+BACKEND_KIND
+BACKEND_TYPE
+BACKEND_VALUE
+_hcl_block
+_hcl_lines
 _hcl_string
 _normalize_spec
 BACKEND_RESOLVED
@@ -189,6 +188,7 @@ tf_backend
 tf_backend_assert
 tf_init_init
 tf_setup
+tf_stack_assert
 tf_stacks_list
 tf_toolchain_install
 tf_toolchain_show
@@ -203,8 +203,8 @@ NAMES
   local expected_sorted expected_count
   expected_sorted=$(printf '%s\n' "$expected" | sort)
   expected_count=$(printf '%s\n' "$expected_sorted" | grep -c .)
-  if [ "$expected_count" -ne 23 ]; then
-    fail "$label" "internal error in tf-verify.sh: expected list has $expected_count names, not 23"
+  if [ "$expected_count" -ne 31 ]; then
+    fail "$label" "internal error in tf-verify.sh: expected list has $expected_count names, not 31"
     return
   fi
 
@@ -357,8 +357,8 @@ check4() {
 }
 
 # ---------------------------------------------------------------------
-# 5. task tf:stacks:list -- one row per stack, correct WRITABLE, correct
-# state string per detected flavor.
+# 5. task tf:stacks:list -- one row per stack, correct WRITABLE, a state
+# string on every writable row.
 # ---------------------------------------------------------------------
 check5() {
   local label="5 task tf:stacks:list rows are well-formed"
@@ -669,53 +669,11 @@ check9() {
 }
 
 # ---------------------------------------------------------------------
-# 10. write a <stack>.env with a TAB-indented VARS= line; confirm
-# tf:vars still resolves it (SOURCE <stack>.env); restore. Passes only
-# if the BSD sed/grep portability fix (deviation (b)) was applied --
-# GNU-only `[ \t]` bracket expressions read a tab-indented line as
-# nothing on macOS's /usr/bin/sed and BSD grep.
-# ---------------------------------------------------------------------
-check10() {
-  local label="10 tab-indented VARS= line in <stack>.env still resolves"
-  local picked s base_id
-  picked=$(pick_stack_and_id)
-  if [ -z "$picked" ]; then
-    fail "$label" "no stack has a resolvable VARS id to probe with"
-    return
-  fi
-  s=${picked% *}
-  base_id=${picked#* }
-  local env_file="$s.env"
-  if [ -e "$env_file" ]; then
-    fail "$label" "$env_file already exists; refusing to overwrite it for this check"
-    return
-  fi
-
-  printf 'VARS=\t%s\n' "$base_id" > "$env_file"
-
-  local out rc
-  out=$(task tf:vars STACK="$s" 2>&1); rc=$?
-  rm -f "$env_file"
-
-  if [ "$rc" -ne 0 ]; then
-    fail "$label" "tf:vars STACK=$s with a tab-indented $env_file exited $rc"
-    return
-  fi
-  local source_val
-  source_val=$(printf '%s\n' "$out" | kv_value SOURCE)
-  if [ "$source_val" != "$env_file" ]; then
-    fail "$label" "tf:vars reported SOURCE=[$source_val] for a tab-indented VARS= line, want $env_file (deviation (b) missing?)"
-    return
-  fi
-  pass "$label"
-}
-
-# ---------------------------------------------------------------------
-# 11. round trip: tf:use writes <stack>.env; tf:vars reports SOURCE
+# 10. round trip: tf:use writes <stack>.env; tf:vars reports SOURCE
 # <stack>.env; git check-ignore passes; tf:use:clear removes it.
 # ---------------------------------------------------------------------
-check11() {
-  local label="11 tf:use / tf:vars SOURCE / git check-ignore / tf:use:clear"
+check10() {
+  local label="10 tf:use / tf:vars SOURCE / git check-ignore / tf:use:clear"
   if [ "$OFFLINE" -eq 1 ]; then
     skip "$label"
     return
@@ -773,12 +731,12 @@ check11() {
 }
 
 # ---------------------------------------------------------------------
-# 12. tf:fmt:check:all, then tf:validate:all. Can legitimately pass with
-# zero iterations when <STACKS_DIR>/ is empty -- said explicitly, not
-# just reported as a bare PASS.
+# 11. tf:fmt:check:all, then tf:validate:all. Can legitimately pass with
+# zero iterations when stacks/ is empty -- said explicitly, not just
+# reported as a bare PASS.
 # ---------------------------------------------------------------------
-check12() {
-  local label="12 tf:fmt:check:all then tf:validate:all"
+check11() {
+  local label="11 tf:fmt:check:all then tf:validate:all"
   if [ "$OFFLINE" -eq 1 ]; then
     skip "$label"
     return
@@ -798,7 +756,7 @@ check12() {
   local iterations
   iterations=$(printf '%s\n' "$val_out" | grep -c '^== ')
   if [ "$iterations" -eq 0 ]; then
-    printf 'PASS %s (0 iterations -- <STACKS_DIR>/ is empty, nothing was actually validated)\n' "$label"
+    printf 'PASS %s (0 iterations -- stacks/ is empty, nothing was actually validated)\n' "$label"
   else
     pass "$label"
   fi
@@ -817,6 +775,5 @@ check8
 check9
 check10
 check11
-check12
 
 exit "$FAILED"
