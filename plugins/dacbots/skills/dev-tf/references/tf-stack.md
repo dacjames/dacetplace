@@ -107,9 +107,15 @@ A glob matching no file is an error, not a silent drop: without that
 check a typo leaves the run with no `-var-file` at all, which tofu
 happily plans from the variables' own defaults.
 
-Default: `VARS=<stack>:variables/<stack>.tfvars` — one named file rather
-than a sweep of `variables/`, so a stack can keep several tfvars files
-there without a bare run collecting them all.
+With no `VARS`, a stack loads `variables/<stack>.tfvars` — one named file
+rather than a sweep of `variables/`, so a stack can keep several tfvars
+files there without a bare run collecting them all. Two rules govern that
+file:
+
+- **A multi-env stack MUST NOT have one.** There is no sensible default
+  environment, so a bare run should be refused, not answered.
+- **A single-stack or multi-stack repo SHOULD have one per stack**, and
+  needs no `VARS_MAP` at all.
 
 **`BACKEND`** selects state, same two forms, mapped by `BACKEND_MAP`.
 Usually not typed, because of where it comes from when missing:
@@ -234,10 +240,9 @@ with the environments named in both maps (`VARS_MAP` as above,
 `BACKEND_MAP` mapping each id to its `.backend.hcl`). Four choices in
 there are load-bearing:
 
-- **No `app.tfvars` and no `app.backend.hcl`, on purpose.** The shared
-  base is named `common.tfvars` so the *default* `VARS` resolves to a
-  file that does not exist and the run is refused. A stack with several
-  environments has no sensible default environment.
+- **No `app.tfvars` and no `app.backend.hcl`, on purpose** — rule 1 above.
+  The shared base is named `common.tfvars` instead, so a bare run is
+  refused rather than silently picking an environment.
 - **The environments need not be symmetric** — a glob matching two
   files, a single file, two named files. Explicit lists make real-world
   asymmetry cost a line rather than an exception.

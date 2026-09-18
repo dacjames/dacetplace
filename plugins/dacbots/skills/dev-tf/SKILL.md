@@ -348,15 +348,20 @@ the environment file **last**. Prefer an explicit comma-separated list over a
 glob whenever two files for one id must be ordered — a single glob expands
 alphabetically. Backend ids come from `variables/*.backend.hcl` basenames.
 
-Shape rules: **single module** → both maps empty (the `VARS_DEFAULT`/
-`BACKEND_DEFAULT` pair already covers it; copying a three-env map into a
-single-env repo is the likeliest mistake here). **Multi-stack** → usually
-still empty. **Multi-env** → both populated, and deliberately *no*
-`<stack>.tfvars`/`<stack>.backend.hcl`, so a bare run is refused rather than
-silently defaulted. **Multi-stack multi-env** → maps are global while
-`variables/` is per stack, so reuse ids across stacks or namespace them
-(`app_dev`, `data_dev`); the `:all` tasks already skip ids a stack has no
-files for.
+Two rules decide the `variables/<stack>.tfvars` question:
+
+1. **Multi-env: MUST NOT** have a `variables/<stack>.tfvars`. A stack with
+   several environments has no sensible default one, so a bare run must be
+   refused rather than quietly picking an environment. Name the shared base
+   `common.tfvars`, and populate both maps.
+2. **Single stack or multi-stack: SHOULD** have a `variables/<stack>.tfvars`,
+   one per stack, and leave both maps empty. A repo that looks multi-env but
+   defines one environment is single-stack: give it `<stack>.tfvars` too.
+
+**Multi-stack multi-env** follows rule 1 per stack. The maps are global while
+`variables/` is per stack, so reuse ids across stacks where the file names
+agree, or namespace them (`app_dev`, `data_dev`) where they don't; the `:all`
+tasks skip ids a stack has no files for.
 
 Flag any `*.auto.tfvars` — tofu auto-loads it independently of `-var-file` and
 `task tf:vars` will not show it. Present both maps for confirmation whenever

@@ -108,11 +108,11 @@ vars:
   USE_BACKEND:
     sh: "scripts/tf-stack.sh USE_BACKEND '{{.ENV_FILE}}'"
 
-  # vars interface: VARS=<id> (CLI) picks a name from VARS_MAP; unset falls
-  # back through USE_VARS to VARS_DEFAULT. Derive VARS_MAP from the tfvars
-  # files the target repo actually has (see dev-tf/SKILL.md step 9) --
-  # never copy another repo's map. A single-module repo leaves this empty
-  # on purpose: VARS_DEFAULT below already covers it.
+  # vars interface: VARS=<id> (CLI) picks a name from VARS_MAP. Derive the map
+  # from the tfvars files this repo actually has (dev-tf/SKILL.md step 9) --
+  # never copy another repo's. Multi-env stacks populate it; single- and
+  # multi-stack repos leave it empty and keep one variables/<stack>.tfvars
+  # per stack.
   #
   # LINE SHAPE: <id>:<glob>[,<glob>...] -- a plain-text list inside a YAML
   # block scalar, not a YAML mapping. The parser is `cut -d: -f2-`, but
@@ -120,10 +120,9 @@ vars:
   # and around each comma, so both of these resolve identically:
   #   dev:variables/common.tfvars,variables/dev.tfvars
   #   dev: variables/common.tfvars, variables/dev.tfvars
-  # The first is canonical; prefer it for consistency with VARS_DEFAULT.
-  # What still matters: ORDER IS PRECEDENCE (tofu lets the last -var-file
-  # win, so shared base first, environment last), and a glob matching no
-  # file is a hard error rather than a silent drop.
+  # The first is canonical. What still matters: ORDER IS PRECEDENCE (tofu lets
+  # the last -var-file win, so shared base first, environment last), and a
+  # glob matching no file is a hard error rather than a silent drop.
   # Confirm after editing with: task tf:vars:ids && task tf:vars STACK=<s> VARS=<id>
   VARS:
   VARS_MAP: |

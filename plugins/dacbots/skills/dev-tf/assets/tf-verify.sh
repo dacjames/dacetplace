@@ -98,11 +98,10 @@ pick_stack_and_id() {
         return 0
       fi
     elif [ -e "$stack_dir/variables/$s.tfvars" ]; then
-      # single-module shape (VARS_MAP empty): the only spelling that is
-      # guaranteed to resolve is VARS_DEFAULT spelled out in full, colon
-      # included ("<stack>:variables/<stack>.tfvars") -- it bypasses the
-      # (empty) map lookup entirely. A bare "VARS=<stack>" would instead
-      # be looked up in VARS_MAP and fail, unlike leaving VARS unset.
+      # Single- or multi-stack shape (VARS_MAP empty, one
+      # variables/<stack>.tfvars per stack). Spell the pick out in full,
+      # colon included, so it bypasses the empty map: a bare "VARS=<stack>"
+      # would be looked up in VARS_MAP and fail, unlike leaving VARS unset.
       printf '%s %s:variables/%s.tfvars\n' "$s" "$s" "$s"
       return 0
     fi
