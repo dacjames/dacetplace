@@ -14,7 +14,17 @@
 
 set -uo pipefail
 
-TASKFILE="Taskfile.yml"
+# go-task accepts either spelling, and repos in the wild use both. Detect
+# rather than assume: hardcoding .yml makes check 3 report "not found" and the
+# STACKS_DIR sniff silently miss on a .yaml repo, and the only way out would be
+# editing this file -- which convention 1 forbids.
+if [ -f "Taskfile.yml" ]; then
+  TASKFILE="Taskfile.yml"
+elif [ -f "Taskfile.yaml" ]; then
+  TASKFILE="Taskfile.yaml"
+else
+  TASKFILE="Taskfile.yml"   # absent either way; check 3 reports it
+fi
 SCRIPT="scripts/tf-stack.sh"
 FAILED=0
 OFFLINE=0
@@ -153,13 +163,13 @@ check1() {
 }
 
 # ---------------------------------------------------------------------
-# 2. scripts/tf-stack.sh help lists exactly the expected 22 function
+# 2. scripts/tf-stack.sh help lists exactly the expected 23 function
 # names -- catches a truncated copy. This set is the frozen ABI (dev-tf
-# plan section 4): a byte-for-byte copy always carries all 22, regardless
+# plan section 4): a byte-for-byte copy always carries all 23, regardless
 # of which backend/toolchain the target repo uses.
 # ---------------------------------------------------------------------
 check2() {
-  local label="2 $SCRIPT help lists exactly 22 functions"
+  local label="2 $SCRIPT help lists exactly 23 functions"
   if [ ! -x "$SCRIPT" ] && [ ! -f "$SCRIPT" ]; then
     fail "$label" "$SCRIPT not found"
     return
@@ -167,6 +177,7 @@ check2() {
   local expected
   expected=$(cat <<'NAMES'
 BACKEND_FILE
+_hcl_string
 _normalize_spec
 BACKEND_RESOLVED
 BACKEND_STATE
@@ -193,8 +204,8 @@ NAMES
   local expected_sorted expected_count
   expected_sorted=$(printf '%s\n' "$expected" | sort)
   expected_count=$(printf '%s\n' "$expected_sorted" | grep -c .)
-  if [ "$expected_count" -ne 22 ]; then
-    fail "$label" "internal error in tf-verify.sh: expected list has $expected_count names, not 22"
+  if [ "$expected_count" -ne 23 ]; then
+    fail "$label" "internal error in tf-verify.sh: expected list has $expected_count names, not 23"
     return
   fi
 

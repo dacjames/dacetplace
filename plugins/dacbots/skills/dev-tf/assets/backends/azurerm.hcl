@@ -1,4 +1,4 @@
-# Selected by BACKEND=<id> (see BACKEND_MAP in Taskfile.yml). Copy this into
+# Selected by BACKEND=<id> (see BACKEND_MAP in the Taskfile). Copy this into
 # <stack>/variables/<id>.backend.hcl and fill in the storage account,
 # container and key. tf:setup is not implemented for this flavor --
 # provision the storage account and container out of band (see

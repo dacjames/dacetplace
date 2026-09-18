@@ -1,6 +1,6 @@
 ---
 name: dev-tf
-description: Replicate the tf-stack terraform/opentofu toolkit into a repo. Copies a proven scripts/tf-stack.sh and a go-task tf:* block out of this skill, detects greenfield vs. update, backs up Taskfile.yml and freezes the CI-called task names behind gated compat shims on update, derives VARS_MAP/BACKEND_MAP from the tfvars and backend configs the repo actually has, and verifies the install offline with task tf:verify. Use when a repo needs terraform or opentofu tasks, when adopting the STACK/VARS/BACKEND stack convention, when harmonizing a hand-rolled tf Taskfile, or asks to replicate tf-stack. Args: optional hints (greenfield, update, gcs, s3, azurerm, local, tofu, terraform) to force the mode, backend or toolchain.
+description: Replicate the tf-stack terraform/opentofu toolkit into a repo. Copies a proven scripts/tf-stack.sh and a go-task tf:* block out of this skill, detects greenfield vs. update, backs up the Taskfile and freezes the CI-called task names behind gated compat shims on update, derives VARS_MAP/BACKEND_MAP from the tfvars and backend configs the repo actually has, and verifies the install offline with task tf:verify. Use when a repo needs terraform or opentofu tasks, when adopting the STACK/VARS/BACKEND stack convention, when harmonizing a hand-rolled tf Taskfile, or asks to replicate tf-stack. Args: optional hints (greenfield, update, gcs, s3, azurerm, local, tofu, terraform) to force the mode, backend or toolchain.
 user-invocable: true
 allowed-tools:
   - Read
@@ -55,7 +55,7 @@ no args, detect all three from the repo.
 | Source | Destination | How |
 |---|---|---|
 | `assets/tf-stack.sh` | `scripts/tf-stack.sh` | verbatim |
-| `assets/taskfile-tf.yml` | merged into `Taskfile.yml` | templated, 10 tokens |
+| `assets/taskfile-tf.yml` | merged into the Taskfile | templated, 10 tokens |
 | `assets/tf-verify.sh` | `scripts/tf-verify.sh` | verbatim |
 | `assets/stack/*` | `<STACKS_DIR>/<name>/` | greenfield only |
 | `assets/backends/<flavor>.hcl` | `variables/<id>.backend.hcl` | templated |
@@ -101,9 +101,9 @@ as a state-affecting decision, not a convenience flag.
 
 | Signal | Value | Obligations |
 |---|---|---|
-| no `Taskfile.yml` | `tf-new` | none; write freely |
-| `Taskfile.yml`, no `tf:` task | `tf-add` | backup; leave every non-tf task untouched |
-| `Taskfile.yml` with `tf:` tasks | `tf-replace` | backup, frozen CI-name list, remove-then-replace |
+| no `Taskfile.{yml,yaml}` | `tf-new` | none; write freely |
+| a Taskfile with no task invoking `terraform`/`tofu` | `tf-add` | backup; leave every non-tf task untouched |
+| a Taskfile with tasks invoking `terraform`/`tofu`, **under any name** | `tf-replace` | backup, frozen CI-name list, remove-then-replace |
 | `scripts/tf-stack.sh` carries `# tf-stack-version:` | `tf-refresh` | diff-only harmonize; no backup, no shims |
 
 *Layout axis* — governs migration and state risk:
@@ -197,6 +197,28 @@ stop and ask, not improvise a replacement.
 ### 2. Detect the mode (both axes)
 
 Compute both signals from the tables above before writing anything.
+
+**Both Taskfile spellings count.** `Taskfile.yml` and `Taskfile.yaml` are
+equally valid to go-task; read "the Taskfile" everywhere below as whichever
+one this repo has. Taking the literal `.yml` reading on a `.yaml` repo detects
+`tf-new`, "writes freely", and leaves a second Taskfile shadowing the real one.
+
+**The `tf-replace` signal is behaviour, not namespace.** A repo whose
+terraform tasks are named `init`, `plan`, `apply`, `otel-plan` is
+`tf-replace`, not `tf-add` — grep the Taskfile for `terraform`/`tofu`
+invocations rather than for a `tf:` prefix. Reading it as `tf-add` installs a
+complete second terraform surface beside the first. Where legacy un-namespaced
+names survive, report the overlap explicitly in step 11, and check whether
+`.claude/settings.local.json` already allowlists them (`Bash(task plan)`,
+`Bash(task apply)`) — those are ungated names that convention 8 assumes do not
+exist.
+
+**Already-installed short-circuit.** If the mode is `tf-refresh` and
+`scripts/tf-stack.sh` matches this skill's asset byte-for-byte, no
+`__DEV_TF_*__` token survives, and `task tf:verify` passes, then the install is
+current: report that and stop. Steps 3–10 all read as though work remains, and
+for a re-run — which is the common case — none does.
+
 `scripts/tf-stack.sh` present with **no** version stamp is hand-written; never
 overwrite it silently — ask. `$ARGUMENTS` `greenfield`/`update` forces the
 Taskfile axis only; the layout axis is always detected regardless of args.
@@ -206,18 +228,26 @@ before step 3.
 ### 3. Freeze the CI interface (`tf-add`/`tf-replace` only)
 
 Grep `.github/workflows/**`, `.gitlab-ci.yml`, `.circleci/config.yml`,
-`.buildkite/**`, `atlantis.yaml`, `Makefile`, and `scripts/*.sh` for `task
-<name>` and for direct `terraform`/`tofu` invocations. That list is the frozen
-interface. If no CI config lives in this repo, say so, ask the user, and fall
+`.buildkite/**`, `atlantis.yaml`, `Makefile`, the Taskfile, and `scripts/*.sh`
+for `task <name>` and for direct `terraform`/`tofu` invocations. That list is
+the frozen interface.
+
+**The direct-invocation half of this grep is not gated on the Taskfile axis.**
+This step's `task <name>` freeze is; the sweep for `-chdir=`, `-var-file=`,
+`-backend-config=`, `path:`, `working-directory:` and bare `cd <dir>` is an
+obligation of **any run that moves a directory**, including a `tf-new` repo
+whose CI drives tofu directly and calls no task at all. Every such hit is a
+rewrite obligation shipping in the same commit as the `git mv` — see step 8.
+Present the count with the layout plan; it is usually the real cost of a move. If no CI config lives in this repo, say so, ask the user, and fall
 back to REPLICATE.md's shape **only as a labelled assumption**. Everything not
 on the list is explicitly allowed to break — state that back to the user; it
 is what makes step 10's remove-then-replace affordable.
 
 ### 4. Back up the Taskfile (`tf-add`/`tf-replace` only)
 
-`cp Taskfile.yml Taskfile.yml.bckp`, `git add` it, and verify with `git
-check-ignore -q Taskfile.yml.bckp` (must fail) and `git ls-files
---error-unmatch Taskfile.yml.bckp` (must succeed) — a gitignored backup cannot
+`cp <taskfile> <taskfile>.bckp` (the spelling the repo actually uses), `git add` it, and verify with `git
+check-ignore -q <taskfile>.bckp` (must fail) and `git ls-files
+--error-unmatch <taskfile>.bckp` (must succeed) — a gitignored backup cannot
 satisfy REPLICATE.md's "commit the backup, remove after a stabilization
 period." An existing `.bckp` belongs to an earlier migration: ask before
 replacing it. Record the backup path and the removal criterion (one green CI
@@ -228,7 +258,7 @@ run on every frozen name) for step 10's migration note.
 `mkdir -p scripts`; `cp assets/tf-stack.sh scripts/tf-stack.sh`; `chmod +x`;
 `cp assets/tf-verify.sh scripts/tf-verify.sh`; `chmod +x`. **Do not open
 `tf-stack.sh` to edit anything above the `# ---- ADAPTER ----` marker.** Then
-merge `assets/taskfile-tf.yml` into `Taskfile.yml`: no Taskfile → invoke
+merge `assets/taskfile-tf.yml` into the Taskfile: no Taskfile → invoke
 `/dev-tasks` first so the frame (`default`, `test`, `silent: true`, permission
 rules) comes from one place, then splice in the tf block. Merging into an
 existing Taskfile: `tf_stack_env: &tf_stack_env` is a **top-level key above
@@ -306,14 +336,11 @@ dev:variables/common.tfvars,variables/dev.tfvars
 prod:variables/common.tfvars,variables/prod.tfvars
 ```
 
-It looks like YAML and is not: the parser is `cut -d: -f2-`, so `dev: vari…`
-puts a leading space inside the first glob, which then matches nothing.
-`task tf:vars` fails with ``glob ' variables/common.tfvars' matched no
-files``, and worse, `task tf:plan:all` **silently** falls back to a single
-default run instead of one run per id. Leading indentation is stripped and
-does not matter. Confirm with `task tf:vars:ids`, then `task tf:vars
-STACK=<s> VARS=<id>`, before moving on — `task tf:verify` check 7 also
-catches it.
+It looks like YAML and is not: the parser is `cut -d: -f2-`, and
+`_normalize_spec` absorbs whitespace around the first colon and each comma
+before it gets there. What still matters is **order**: written order is
+precedence order, because tofu lets the last `-var-file` win. Confirm with
+`task tf:vars:ids`, then `task tf:vars STACK=<s> VARS=<id>`, before moving on.
 
 For each stack, list `variables/*.tfvars` and `variables/*.backend.hcl`.
 Detect a shared base (`common`/`base`/`shared`/`global`) and put it **first**;
@@ -343,19 +370,38 @@ edit, then write the new block in the next — never merge a legacy var into
 the new chain. `tf-add`: insert, preserving everything. `tf-refresh`: diff and
 apply only differences; present anything ambiguous instead of changing it.
 
-For each frozen CI name the new surface lacks: a **read-only name**
-(`tf:init`, `tf:validate`, `tf:fmt`) gets an `aliases:` entry on the canonical
-task; a **writing name** (`tf:apply`, `tf:destroy`) gets a **visible wrapper
-task** with `desc: 'CI compat shim for tf:apply:ask — remove after
-stabilization'` whose `cmds` is `[{task: tf:apply:ask}]`, **plus its own
-permission rule written in this same step** (`Bash(task tf:apply)` →
-`permissions.ask`; `Bash(task tf:destroy)` → `permissions.deny`) — this is the
-whole point: `Bash(task *:ask)` matches the name typed, so a shim without a
-rule silently restores an ungated apply. `set-env-<env>` maps to one ungated
-wrapper per env running `task tf:use STACK=<s> VARS=<env>`.
+For each frozen CI name the new surface lacks: a **read-only name** (`tf:init`,
+`tf:validate`, `tf:fmt`) gets an `aliases:` entry on the canonical task; a
+**writing name** (`tf:apply`, `tf:destroy`) gets a **visible wrapper task**,
+**plus its own permission rule written in this same step** (`Bash(task
+tf:apply)` → `permissions.ask`; `Bash(task tf:destroy)` → `permissions.deny`)
+— this is the whole point: `Bash(task *:ask)` matches the name typed, so a
+shim without a rule silently restores an ungated apply.
+
+**Write every shim as a shell wrapper, exactly like the `:all` tasks** — one
+`task …` command line carrying the selectors, never a `cmds: [{task: …, vars:
+{…}}]` call:
+
+```yaml
+  tf:apply:
+    desc: CI compat shim for tf:apply:ask (remove after stabilization)
+    cmds:
+      - env -u TF_DATA_DIR task tf:apply:ask STACK=<s> VARS=<id>
+```
+
+A call-scoped `vars:` block propagates **one level only**. `tf:apply:ask`
+opens with four nested `- task:` guard calls, so the structured form gives
+`tf:apply:ask` the right `STACK` and then hands `tf:stack:assert`,
+`tf:toolchain:assert:tofu`, `tf:vars:assert` and `tf:init:once` an **empty**
+one: the guards validate the default stack, `tf:init:once` initialises the
+default stack's backend, and the apply runs anyway. A selector passed on a
+command line is a global, so it reaches every depth. `env -u TF_DATA_DIR` for
+the same reason the `:all` loops carry it — `DATA_DIR` must be recomputed from
+the shim's own `BACKEND_ID`, not inherited. `set-env-<env>` maps to one
+ungated wrapper per env running `task tf:use STACK=<s> VARS=<env>`.
 
 Merge `.gitignore` (each guarded by `grep -qxF`): `<TMP>/`, `.terraform*/`,
-`.terraform.lock.hcl`, `*.env`, `*.tfplan`; confirm `Taskfile.yml.bckp` is
+`.terraform.lock.hcl`, `*.env`, `*.tfplan`; confirm `<taskfile>.bckp` is
 **not** matched. Merge `.claude/settings.local.json`: `Bash(task *:ask)` /
 `Bash(task *:deny)` (delegate to `/dev-tasks` step 5 if absent) plus the shim
 rules; **write no raw `Bash(tofu…)`/`Bash(terraform…)`/`Bash(gcloud…)`

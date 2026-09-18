@@ -26,6 +26,44 @@ _normalize_spec() {
       -e 's/[[:space:]]*,[[:space:]]*/,/g'
 }
 
+# The value of a quoted HCL string key, or empty. Comments are stripped first --
+# # and // to end of line, and /* */ spans -- because a plain sed capture of
+# `bucket = "b" # TBD: create it` takes the comment with it, and the corrupted
+# name then reaches `gcloud storage buckets describe gs://b # TBD: create it`,
+# which cannot match anything. A commented-out key must also not win over the
+# live one below it.
+_hcl_string() {
+  local key="$1" file="$2"
+
+  awk -v key="$key" '
+    {
+      line = $0
+      while (1) {
+        if (inblock) {
+          i = index(line, "*/")
+          if (i == 0) next
+          line = substr(line, i + 2)
+          inblock = 0
+        }
+        i = index(line, "/*")
+        if (i == 0) break
+        rest = substr(line, i + 2)
+        j = index(rest, "*/")
+        if (j == 0) { line = substr(line, 1, i - 1); inblock = 1; break }
+        line = substr(line, 1, i - 1) substr(rest, j + 2)
+      }
+      sub(/^[ \t]+/, "", line)
+      if (line ~ /^(#|\/\/)/) next
+      if (match(line, "^" key "[ \t]*=[ \t]*\"[^\"]*\"")) {
+        s = substr(line, RSTART, RLENGTH)
+        sub(/^[^"]*"/, "", s)
+        sub(/"$/, "", s)
+        print s
+        exit
+      }
+    }' "$file"
+}
+
 # VARS_RESOLVED / BACKEND_RESOLVED: expand a bare id (VARS=dev) through its
 # map to the spelled-out <id>:<glob,...> or <id>:<path>. A value that already
 # has a ':' passes through (normalized) -- only the bare-id form needs a
@@ -160,15 +198,15 @@ BACKEND_STATE() {
   [ -f "$file" ] || { printf 'local, plan-only'; exit 0; }
 
   local bucket prefix key storage_account container path address organization wsname
-  bucket=$(sed -n 's/^[[:space:]]*bucket[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$file")
-  prefix=$(sed -n 's/^[[:space:]]*prefix[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$file")
-  key=$(sed -n 's/^[[:space:]]*key[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$file")
-  storage_account=$(sed -n 's/^[[:space:]]*storage_account_name[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$file")
-  container=$(sed -n 's/^[[:space:]]*container_name[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$file")
-  path=$(sed -n 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$file")
-  address=$(sed -n 's/^[[:space:]]*address[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$file")
-  organization=$(sed -n 's/^[[:space:]]*organization[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$file")
-  wsname=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$file")
+  bucket=$(_hcl_string bucket "$file")
+  prefix=$(_hcl_string prefix "$file")
+  key=$(_hcl_string key "$file")
+  storage_account=$(_hcl_string storage_account_name "$file")
+  container=$(_hcl_string container_name "$file")
+  path=$(_hcl_string path "$file")
+  address=$(_hcl_string address "$file")
+  organization=$(_hcl_string organization "$file")
+  wsname=$(_hcl_string name "$file")
 
   if [ -n "$storage_account" ] && [ -n "$container" ] && [ -n "$key" ]; then
     printf 'az://%s/%s/%s' "$storage_account" "$container" "$key"
@@ -450,8 +488,8 @@ tf_setup() {
 
       local bucket prefix
       if [ -f "$backend" ]; then
-        bucket=$(sed -n 's/^ *bucket *= *"\(.*\)"/\1/p' "$backend")
-        prefix=$(sed -n 's/^ *prefix *= *"\(.*\)"/\1/p' "$backend")
+        bucket=$(_hcl_string bucket "$backend")
+        prefix=$(_hcl_string prefix "$backend")
       else
         bucket="$state_bucket"
         prefix="$V_STACK"
@@ -483,7 +521,7 @@ tf_setup() {
         exit 1
       fi
       local path
-      path=$(sed -n 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$backend")
+      path=$(_hcl_string path "$backend")
       [ -n "$path" ] || {
         echo "$backend names no path." >&2
         exit 1
