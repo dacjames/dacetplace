@@ -206,10 +206,18 @@ terraform secrets. On yes:
   dirs or workspaces), use `<env>.secret.tfvars` per env, colocated with that
   env's other vars.
 - The secret tfvars must be:
-  1. **Passed to terraform/opentofu tasks** via `-var-file=<…>.secret.tfvars`.
-     Harmonize the existing `tf:*:ask` tasks from `/dev-tasks` (per env) to
-     thread the flag; if those tasks don't exist, note it and add the flag where
-     the project invokes terraform/tofu.
+  1. **Wired into `VARS_MAP`, not threaded as a flag.** Grep `Taskfile.yml`
+     for `VARS_MAP:`. When present (a [`/dev-tf`](../dev-tf/SKILL.md)
+     install), append the secret tfvars path as an explicit entry placed
+     **last** in each relevant `VARS_MAP` line — written order is precedence
+     order, so the last `-var-file` wins — then verify with `task tf:vars
+     STACK=<stack> VARS=<id>`. **Never add `-var-file` to an `:ask`-suffixed
+     apply task**: `tf:apply:ask` applies a previously saved plan file
+     (`{{.TF}} apply {{.PLAN_FILE}}`) and accepts no var-file at all; values
+     are resolved earlier by the ungated `tf:plan`. Keep flag-threading —
+     adding `-var-file=<…>.secret.tfvars` directly to the command — only as
+     the fallback for a bare terraform project with no `VARS_MAP`, applied to
+     whichever task runs a fresh `-var-file` invocation.
   2. **Gitignored** — merge `*.secret.tfvars` into `.gitignore`.
   3. **Round-tripped** — add each secret tfvars path to `secrets/manifest.txt`
      (they live with the tfvars, not inside `secrets/`), so `secrets:upload` /
@@ -243,3 +251,10 @@ terraform `-var-file` per env) vs. skipped. End with the caveats below.
 - **Only GCP is implemented.** AWS / Azure detection hooks exist but their
   command blocks are TODO; the skill will tell you and stop (or proceed
   GCP-style only if you force it).
+- **A secret-tfvars name can collide with an existing glob, and lose.** A file
+  named `dev.secret.tfvars` both matches an existing `dev*.tfvars` glob **and**
+  sorts alphabetically *before* `dev.tfvars`, so the plaintext file silently
+  overrides the secret — backwards from intent. An id written as an explicit
+  comma-separated list (rather than a glob) picks up nothing without an edit
+  to add it. Prefer a secret-tfvars name that cannot match an existing glob,
+  and always confirm the resolved order with `task tf:vars`.

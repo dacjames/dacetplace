@@ -71,7 +71,30 @@ generalization yes, complexity-to-force-reuse no.
 No Taskfile? Run [`/dev-tasks`](../dev-tasks/SKILL.md) to scaffold one, or drop
 the script in `scripts/` and call it directly.
 
-### 4. Last resort: temp location
+### 4. Shared bash logic needed by 3+ tasks?
+
+When the same bash logic is needed by three or more tasks and the call sites
+share a lot of caller context, don't write N script files and don't duplicate
+inline snippets across `cmds:`. Write **one** dispatch-style script
+(`scripts/<name>.sh <function> [args]`) with named functions dispatched via
+`declare -F "$cmd"` then `"$cmd" "$@"` — never `-c` — plus **one** `env:
+&anchor` block carrying the shared vars into it at a `V_` prefix.
+
+Worked example: [`/dev-tf`](../dev-tf/SKILL.md)'s `scripts/tf-stack.sh` — 21
+functions behind one positional entrypoint, dispatched via `declare -F`, called
+from 15+ Taskfile `sh:`/`cmds:` sites, fed by one `tf_stack_env` anchor.
+
+Contract: the script is **executed, never sourced** (its last line is `"$cmd"
+"$@"`), so `exit N` inside a function is the failure idiom — the process exit
+code is the only signal the calling task sees. `return` is reserved for the one
+case where an empty result is itself a valid answer, not for failure.
+
+Anchor caveat: the anchor is the **only** channel from the Taskfile's `vars:`
+block into the script. A variable the script needs must be added to **both**
+the `vars:` block and the anchor — miss one side and the script silently reads
+an empty string, with no error.
+
+### 5. Last resort: temp location
 
 Reusability is **consistently underestimated at write time** — exhaust 1–3
 first. A "one-off" test usually belongs in the existing smoke test; a "one-off"
@@ -90,9 +113,14 @@ once and re-runs after edits — inline re-prompts every time.
 | Similar task/script exists | Update it (dup over complexity) |
 | bash, 1–5 lines | New Taskfile task, bash inline in `cmds` |
 | bash, larger | `scripts/*.sh` called from a task |
+| Same bash logic in 3+ tasks | One dispatch script + one env anchor |
 | python / js / ts / other | `scripts/*.py` (etc.), never `-c`/`-e` |
 | new test case | Extend the existing smoke/e2e test |
 | nothing durable fits | Gitignored `tmp/`|`wip/` file, never system temp |
+
+A skill's own bundled `assets/`/`references/` is a codification home too: a
+script a skill installs into many repos belongs in the skill dir, versioned and
+copied, not regenerated per repo.
 
 ---
 
@@ -102,7 +130,7 @@ once and re-runs after edits — inline re-prompts every time.
 2. **Search** for an existing home — Glob/Grep `Taskfile.yml`, `scripts/`,
    `tmp/`, `wip/`, and test files for a match; prefer updating it.
 3. **Route** per the procedure: update existing → task-inline bash → script file
-   → gitignored temp.
+   → dispatch script + env anchor → gitignored temp.
 4. **Write** it, then run **that** (task or file), not the inline form.
 5. **Report** where it landed, how to re-run (`task <name>` or the path), and
    anything deferred for the user to confirm.

@@ -248,6 +248,69 @@ Bash(cargo clippy:*)
 Bash(cargo fmt:*)
 ```
 
+### tf (note, not a default ruleset)
+
+Once [`/dev-tf`](../dev-tf/SKILL.md) or `/dev-tasks` installs the task surface,
+**no raw terraform rule is needed**: every `tofu`/`terraform`/`gcloud` call
+happens inside a task's `cmds`, so Claude's Bash check only ever sees a
+command like `task tf:apply:ask`. **Never add `Bash(tofu:*)`,
+`Bash(terraform:*)`, or `Bash(gcloud:*)`** — a blanket allow silently bypasses
+every `:ask`/`:deny` task gate underneath it.
+
+Install the strings below **only** for a repo that invokes these binaries
+outside `task`:
+
+`allow` (read-only, no state lock):
+```
+Bash(tofu fmt:*)
+Bash(tofu validate:*)
+Bash(tofu version:*)
+Bash(tofu show:*)
+Bash(tofu output:*)
+Bash(terraform fmt:*)
+Bash(terraform validate:*)
+Bash(terraform version:*)
+Bash(terraform show:*)
+Bash(terraform output:*)
+```
+
+`ask` (contacts a backend, takes a lock, or mutates state/lockfile):
+```
+Bash(tofu init:*)
+Bash(tofu plan:*)
+Bash(tofu apply:*)
+Bash(tofu import:*)
+Bash(tofu taint:*)
+Bash(tofu untaint:*)
+Bash(tofu state:*)
+Bash(terraform init:*)
+Bash(terraform plan:*)
+Bash(terraform apply:*)
+Bash(terraform import:*)
+Bash(terraform taint:*)
+Bash(terraform untaint:*)
+Bash(terraform state:*)
+Bash(gcloud storage buckets create:*)
+Bash(gcloud services enable:*)
+```
+
+`deny` (irreversible or gate-defeating; deny wins over the asks above):
+```
+Bash(tofu destroy:*)
+Bash(terraform destroy:*)
+Bash(tofu apply -auto-approve:*)
+Bash(terraform apply -auto-approve:*)
+Bash(tofu state rm:*)
+Bash(terraform state rm:*)
+Bash(tofu workspace delete:*)
+Bash(terraform workspace delete:*)
+Bash(gcloud storage rm:*)
+```
+
+**CI-shim corollary:** a shim or alias exposing a gated task under an ungated
+name needs its own explicit `Bash(task <name>)` ask / `Bash(task <name>)` deny
+entry, written in the same edit that adds the shim.
+
 ---
 
 ## Caveats to surface to the user
@@ -266,3 +329,8 @@ Bash(cargo fmt:*)
   path auto-approves and survives edits). The deny can still be bypassed via
   heredocs or piping into the interpreter (`cat x | python`); the `CLAUDE.md`
   instruction is the real guard for those.
+- **Gating is by task name, not by what the task runs.** `Bash(task *:ask)`
+  matches the command text Claude invokes; it knows nothing about the `tofu
+  apply` inside the task. Allowlisting the binary directly (see the `tf` note
+  above), or exposing the task under a name without the suffix, removes the
+  gate with no error.

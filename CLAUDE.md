@@ -4,30 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-dacbot — fill in description as project takes shape.
+dacjames' Claude Code plugin marketplace. One plugin, `dacbots`, ships the
+`dev-*` skills: `dev-permissions`, `dev-tasks`, `dev-secrets`, `dev-codify`,
+`dev-tf`.
 
 ## Commands
 
-<!-- Add build/test/lint/run commands here as the project is set up. Example:
+Run `/plugin marketplace update dacetplace` to reload after editing a skill.
+When a skill's bundled **assets** change, bump `version` in
+`plugins/dacbots/.claude-plugin/plugin.json` first — the plugin cache is keyed
+by version, so an edited asset stays invisible to installs until the bump.
 
-```bash
-# Install dependencies
-npm install
-
-# Run
-npm start
-
-# Test
-npm test
-
-# Lint
-npm run lint
-```
--->
+Nothing to build or test yet. The `dev-tf` fixture smoke test lives at
+`tmp/dev-tf-smoke/`.
 
 ## Architecture
 
-<!-- Document high-level architecture here once code exists. -->
+`plugins/dacbots/skills/<name>/SKILL.md` is the unit of a skill. `assets/` and
+`references/` beside it (new with `dev-tf`) are bundled resources, referenced
+by path relative to the skill dir. `dev-tasks/SKILL.md` is the canonical
+Taskfile convention spec — point readers there, not at `wip/tasks.md`.
 
 <!-- dev-permissions:fs-nav -->
 ## Filesystem navigation
