@@ -61,13 +61,14 @@ list_stacks() {
     sed '/^$/d'
 }
 
-# stacks live under stacks/: the one layout tf-stack.sh's tf_stacks_list and
-# the Taskfile's STACK_DIR both hardcode. Spelled here rather than asked of
-# `task`, because a stack with no valid default VARS/BACKEND (any real
-# multi-env stack) refuses tf:backend before ever printing a DATA_DIR/FILE
-# line STACK_DIR could be parsed back out of.
+# stacks live under STACKS_DIR (a Taskfile var; default "stacks"). Read from
+# the STACKS_DIR env var here rather than asked of `task`, because a stack
+# with no valid default VARS/BACKEND (any real multi-env stack) refuses
+# tf:backend before ever printing a DATA_DIR/FILE line STACK_DIR could be
+# parsed back out of. Export STACKS_DIR before running this script when the
+# Taskfile's default has been edited away from "stacks".
 stack_dir_for() {
-  printf 'stacks/%s' "$1"
+  printf '%s/%s' "${STACKS_DIR:-stacks}" "$1"
 }
 
 # picks one stack and one VARS id that actually resolves for it, printed
@@ -262,6 +263,7 @@ tf:output
 tf:clean
 tf:apply:ask
 tf:refresh:ask
+tf:force-unlock:ask
 tf:destroy:deny
 tf:verify'
 
@@ -732,7 +734,7 @@ check10() {
 
 # ---------------------------------------------------------------------
 # 11. tf:fmt:check:all, then tf:validate:all. Can legitimately pass with
-# zero iterations when stacks/ is empty -- said explicitly, not just
+# zero iterations when STACKS_DIR is empty -- said explicitly, not just
 # reported as a bare PASS.
 # ---------------------------------------------------------------------
 check11() {
@@ -756,7 +758,7 @@ check11() {
   local iterations
   iterations=$(printf '%s\n' "$val_out" | grep -c '^== ')
   if [ "$iterations" -eq 0 ]; then
-    printf 'PASS %s (0 iterations -- stacks/ is empty, nothing was actually validated)\n' "$label"
+    printf 'PASS %s (0 iterations -- STACKS_DIR is empty, nothing was actually validated)\n' "$label"
   else
     pass "$label"
   fi

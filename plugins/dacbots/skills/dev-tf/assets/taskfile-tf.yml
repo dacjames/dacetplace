@@ -48,6 +48,7 @@ tf_stack_env: &tf_stack_env
   V_LOCK_STASH: "{{.LOCK_STASH}}"
   V_STACK: "{{.STACK}}"
   V_STACK_DIR: "{{.STACK_DIR}}"
+  V_STACKS_DIR: "{{.STACKS_DIR}}"
   V_STACKS: "{{.STACKS}}"
   V_ENV_FILE: "{{.ENV_FILE}}"
   V_USE_VARS: "{{.USE_VARS}}"
@@ -86,11 +87,14 @@ vars:
   STATE_LOCATION: '__DEV_TF_STATE_LOCATION__'
 
   # stack interface: which stack, its dir, and the full list (for the :all
-  # tasks)
+  # tasks). STACKS_DIR is the root holding every stack; override it on the
+  # CLI (task tf:plan STACKS_DIR=infra STACK=app) or by editing the default
+  # below.
+  STACKS_DIR: '{{.STACKS_DIR | default "stacks"}}'
   STACK: '{{.STACK | default "main"}}'
-  STACK_DIR: 'stacks/{{.STACK}}'
+  STACK_DIR: '{{.STACKS_DIR}}/{{.STACK}}'
   STACKS:
-    sh: "ls -d stacks/*/ | sed 's|stacks/||; s|/$||' | tr '\\n' ' '"
+    sh: 'for d in "{{.STACKS_DIR}}"/*/; do if [ -d "$d" ]; then basename "$d"; fi; done | tr "\n" " "'
 
   # .env file: tf:use writes VARS/BACKEND here; USE_VARS/USE_BACKEND read
   # them back
@@ -388,7 +392,7 @@ tasks:
       - 'TF_DATA_DIR={{.DATA_DIR_LOCAL}} {{.TF}} validate {{.CLI_ARGS}}'
 
   tf:validate:all:
-    desc: Offline-validate every stack under stacks/
+    desc: Offline-validate every stack under {{.STACKS_DIR}}/
     silent: false
     env: *tf_stack_env
     cmds:
@@ -561,6 +565,20 @@ tasks:
       - task: tf:vars:assert
       - task: tf:init:once
       - '{{.TF}} apply -refresh-only {{.VAR_FILES}} {{.CLI_ARGS}}'
+
+  # Flags go before the lock id: force-unlock takes exactly one positional argument.
+  tf:force-unlock:ask:
+    desc: Remove a stale state lock on the {{.STACK}} stack, ID=<lock id> (ai-ask gated)
+    dir: '{{.STACK_DIR}}'
+    preconditions:
+      - sh: test -n "{{.ID}}"
+        msg: 'ID is required -- the lock id from the "Error acquiring the state lock" message: task tf:force-unlock:ask STACK={{.STACK}} ID=<lock id>'
+    cmds:
+      - task: tf:stack:assert
+      - task: tf:toolchain:assert:tofu
+      - task: tf:vars:assert
+      - task: tf:init:once
+      - '{{.TF}} force-unlock -force {{.VAR_FILES}} {{.CLI_ARGS}} {{.ID}}'
 
   tf:destroy:deny:
     desc: Destroy all managed infrastructure in the {{.STACK}} stack (ai-deny gated)

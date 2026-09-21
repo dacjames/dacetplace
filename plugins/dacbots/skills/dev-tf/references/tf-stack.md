@@ -6,7 +6,9 @@ module, more than one environment, or both. Three parts: **`Taskfile.yml`**
 steer them), **`scripts/tf-stack.sh`** (the resolvers, guards and `show`
 commands behind them), and **a layout convention** — `stacks/<name>/` for
 root modules, `modules/` for shared modules, `stacks/<name>/variables/` for
-a stack's tfvars and backend configs.
+a stack's tfvars and backend configs. The root directory (`stacks/` above) is
+`STACKS_DIR`, defaulting to `stacks/`; set it once on the CLI or in
+`Taskfile.yml` to use a different layout.
 
 Nothing replaces Terraform: every task ends in an ordinary `tofu
 plan`/`apply` with `-var-file` and `-backend-config` worked out for you.
@@ -87,7 +89,8 @@ task tf:plan:all  STACK=app                     # one plan per name in VARS_MAP
 **`STACK`** is the root module directory — `STACK=app` means `stacks/app/`,
 and every `tf:*` task that reaches tofu runs with that as its working
 directory, so all paths in `VARS` and `BACKEND` are **stack-relative**.
-Defaults to `main`.
+Defaults to `main`. The directory is `STACK_DIR = STACKS_DIR/STACK`, so
+overriding `STACKS_DIR` moves every stack at once.
 
 **`VARS`** selects tfvars, in two equivalent forms — `VARS=<vars_id>`,
 looked up in `VARS_MAP`, or `VARS=<vars_id>:<glob>[,<glob>...]` spelled
@@ -398,7 +401,7 @@ passes `-backend-config=<file>` through.
 | `tf:fmt:check:all` | The same check across every stack and module |
 | `tf:validate` | `validate` against the real backend (inits first) |
 | `tf:validate:local` | `validate` offline — no backend, no credentials |
-| `tf:validate:all` | Offline-validate every stack under `stacks/` |
+| `tf:validate:all` | Offline-validate every stack under `STACKS_DIR` |
 | `tf:verify` | Offline self-check of the install — scripts, tasks, maps and guards. `-- --offline` skips the two that run tofu |
 
 `task test` runs `tf:fmt:check:all` and `tf:validate:all` — the offline
@@ -433,6 +436,7 @@ resolve. `tf:output` and `tf:clean` are ungated.
 | --- | --- |
 | `tf:apply:ask` | Apply the **saved plan file**, not a fresh plan |
 | `tf:refresh:ask` | `apply -refresh-only` — reconcile state with reality, change nothing |
+| `tf:force-unlock:ask` | `force-unlock -force <var-files> ID=<lock id>` — drop a stale state lock on the chosen `BACKEND` |
 | `tf:destroy:deny` | `destroy` everything the stack manages |
 | `tf:output` | Print the stack's outputs |
 | `tf:clean` | Remove every toolchain's provider dir, the lock file and stash, and the temp dir |

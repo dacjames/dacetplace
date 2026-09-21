@@ -37,12 +37,13 @@ allowed-tools:
 
 Installs three things this skill has already proven elsewhere: the `tf:*`
 go-task block and its variable-resolution chain, `scripts/tf-stack.sh` (the
-functions those tasks call by name), and the `stacks/<name>/` layout convention
-that keeps each root module's `variables/*.tfvars` and `*.backend.hcl` self
-contained. On top of that it adds selection of a stack by name, guards that
-run before tofu ever touches a backend, and collision-free `TF_DATA_DIR`/plan
-file names across every stack × vars × backend × toolchain combination. **This
-skill copies artifacts; it does not regenerate them.** See
+functions those tasks call by name), and the `<STACKS_DIR>/<name>/` layout
+convention (`STACKS_DIR` defaults to `stacks`) that keeps each root module's
+`variables/*.tfvars` and `*.backend.hcl` self contained. On top of that it
+adds selection of a stack by name, guards that run before tofu ever touches a
+backend, and collision-free `TF_DATA_DIR`/plan file names across every stack ×
+vars × backend × toolchain combination. **This skill copies artifacts; it
+does not regenerate them.** See
 [`/dev-tasks`](../dev-tasks/SKILL.md) for the base Taskfile conventions and
 permission-rule mechanics this skill builds on, and
 [`/dev-codify`](../dev-codify/SKILL.md) for why the logic ships as one dispatch
@@ -62,7 +63,7 @@ configuration in step 2.
 | `assets/tf-stack.sh` | `scripts/tf-stack.sh` | verbatim |
 | `assets/taskfile-tf.yml` | merged into the Taskfile | templated, 8 tokens |
 | `assets/tf-verify.sh` | `scripts/tf-verify.sh` | verbatim |
-| `assets/stack/*` | `stacks/<name>/` | greenfield only |
+| `assets/stack/*` | `<STACKS_DIR>/<name>/` | greenfield only |
 | `assets/backends/gcs.hcl` | `variables/<id>.backend.hcl` | templated |
 | `references/tf-stack.md` | `docs/tf-stack.md` | adapted |
 | `references/migration.md` | read on demand | never copied |
@@ -81,7 +82,7 @@ name.
 |---|---|---|
 | `tf:*` tasks + variable chain | Selection (`STACK`/`VARS`/`BACKEND`/`TF`), guards, init/plan/apply/validate wiring | A misnamed var silently no-ops a task instead of erroring |
 | `scripts/tf-stack.sh` | The 13 uppercase resolvers plus every function a Taskfile `sh:` block calls by name | Renaming a function breaks variable evaluation for every task, with an opaque `unknown command` |
-| `stacks/<name>/` layout | One root module per stack, each with its own `variables/*.tfvars` and `variables/*.backend.hcl` | Two stacks sharing a data dir or plan file corrupt each other's plan/state silently |
+| `<STACKS_DIR>/<name>/` layout | One root module per stack under the one dir `STACKS_DIR` names (default `stacks`), each with its own `variables/*.tfvars` and `variables/*.backend.hcl` | Two stacks sharing a data dir or plan file corrupt each other's plan/state silently |
 
 | Selector | Picks | Source |
 |---|---|---|
@@ -118,7 +119,7 @@ root modules and backends per root module. Step 2 says how to get them.
 
 | Root modules | Backends each | Value | Migrates to |
 |---|---|---|---|
-| — (no `*.tf`) | — | `shape-none` | scaffold `stacks/main/` |
+| — (no `*.tf`) | — | `shape-none` | scaffold `<STACKS_DIR>/main/` (default `stacks/main/`) |
 | 1 | 1 | `shape-single` | one stack; `variables/<stack>.tfvars`; both maps empty |
 | 1 | >1 | `shape-multi-env` | one stack; a `.backend.hcl` + tfvars per env; both maps populated; **no** `<stack>.tfvars` |
 | >1 | 1 each | `shape-multi-stack` | one stack per root module; `variables/<stack>.tfvars` each; both maps empty |
@@ -136,10 +137,20 @@ Two degenerate readings, both common:
   call different sets of shared `modules/`, are different stacks.
 
 *Placement* is a consequence of the shape, decided **per root module** in step
-8 — each one either already sits at `stacks/<name>/` or gets a proposed
-`git mv` into it. `stacks/` is the layout, not a knob: there is nothing to
-configure and nowhere else for a stack to live. It is never a repo-wide
-verdict, and never a reason to skip the inspection above.
+8 — each one either already sits at `<STACKS_DIR>/<name>/` or gets a proposed
+`git mv` into it. `STACKS_DIR` (a Taskfile var, default `stacks`) names the
+**one** dir every stack lives under — it is a repo-wide knob, not a per-stack
+one: every root module must share that same parent, so a repo whose modules
+already sit together under one consistent dir (`terraform/`, `infra/`,
+`live/`) needs no `git mv` — point `STACKS_DIR` at it as-is, or rename it to
+the conventional `stacks/` first; step 8 asks the user which. The one case
+that still forces a move: a single root module sitting directly
+at that shared parent, most often the repo root itself, with no name of its
+own — a dir cannot be both the list of stacks and a stack's own files, so
+step 8 infers a name and moves it one or two levels, user-confirmed either
+way. Only modules that do **not** already share one common parent (or share
+it with no name of their own) get a proposed move. This is never a reason to
+skip the inspection above.
 
 `GREENFIELD = tf-new + (shape-none | every root module already placed)`.
 Everything else is UPDATE. `tf-refresh` is its own lighter path. Ambiguity →
@@ -385,16 +396,60 @@ for a stack whose backend is inline.
 
 **Greenfield writes the type into the stack too.** `assets/stack/backend.tf`
 ships its `backend "<type>" {}` block with a `__DEV_TF_*__` placeholder in the
-type slot, so the copy step 5 made at `stacks/<name>/backend.tf` does not parse
-until the detected type is written in. Nothing else catches it: `tf:verify`
-check 4 scans the Taskfile, `scripts/` and `docs/`, never `stacks/`.
+type slot, so the copy step 5 made at `<STACKS_DIR>/<name>/backend.tf` does not
+parse until the detected type is written in. Nothing else catches it:
+`tf:verify` check 4 scans the Taskfile, `scripts/` and `docs/`, never
+`STACKS_DIR`.
 
 ### 8. Settle placement and extraction, per root module
 
-**Placement.** For each root module the shape found, decide whether it already
-sits at `stacks/<name>/` or needs to move there. List every one and its
-proposed destination, present the list, move only after confirmation, one
-stack at a time, `git mv` so history follows. Keep each backend's
+**Placement.** Two directories, both discovered before anything moves:
+
+- **`IMPLIED_STACKS_DIR`** — the closest thing to a stacks root the repo
+  already has: the one parent directory every root module the shape found
+  already shares. For `shape-multi-stack`/`shape-multi-both` this is usually
+  a real subdirectory (`terraform/`, `infra/`); for `shape-single`/
+  `shape-multi-env` (one root module) it is that module's own parent, which
+  is frequently the repo root itself.
+- **`IMPLIED_MAIN_STACK_DIR`** — the directory actually holding a root
+  module's own `.tf` files: one per module for `shape-multi-stack`/
+  `shape-multi-both`, or the repo's one root module's directory for
+  `shape-single`/`shape-multi-env`.
+
+**`IMPLIED_STACKS_DIR` and `IMPLIED_MAIN_STACK_DIR` must never be the same
+directory** — one dir cannot be both the list of stacks and a stack's own
+files.
+
+- **Conforming** (`IMPLIED_STACKS_DIR` ≠ `IMPLIED_MAIN_STACK_DIR` — the
+  common `shape-multi-stack` case, and any `shape-single`/`shape-multi-env`
+  repo whose one module already sits in a named subdirectory): no module
+  needs to move. Renaming `IMPLIED_STACKS_DIR` itself is optional — ask the
+  user:
+  1. **Do nothing** — point `STACKS_DIR` at `IMPLIED_STACKS_DIR` as it
+     already is, by editing its default in the spliced Taskfile block
+     (`STACKS_DIR: '{{.STACKS_DIR | default "stacks"}}'`).
+  2. **Rename to the conventional `stacks/`** — `git mv
+     <IMPLIED_STACKS_DIR> stacks`, and `STACKS_DIR` stays the shipped
+     default.
+- **Non-conforming** (`IMPLIED_STACKS_DIR` = `IMPLIED_MAIN_STACK_DIR` — the
+  common `shape-single`/`shape-multi-env` case, where the one module's `.tf`
+  files sit directly at what would be `STACKS_DIR`, usually the repo root):
+  what's missing is a name, not a directory. Infer `IMPLIED_STACK` from repo
+  context — the repo's own name is usually it, e.g. a repo named
+  `tf-gcp-networking` implies `gcp-networking` — and **always confirm it
+  with the user**, never assume silently. Then present exactly two moves and
+  let the user pick (tweak the wording to the repo's actual context):
+  1. **Convert to the standard layout** — `STACKS_DIR='stacks'`,
+     `STACK='<IMPLIED_STACK>'`; the module moves two levels, from the repo
+     root into `stacks/<IMPLIED_STACK>/`.
+  2. **Keep the root as `STACKS_DIR`** — `STACKS_DIR='.'`,
+     `STACK='<IMPLIED_STACK>'`; the module moves one level, from the repo
+     root into `<IMPLIED_STACK>/`, with no `stacks/` wrapper introduced.
+
+Once `STACKS_DIR` is settled: for each root module, decide whether it already
+sits at `STACKS_DIR/<name>/` or needs the proposed move there. List every one
+and its proposed destination, present the list, move only after confirmation,
+one stack at a time, `git mv` so history follows. Keep each backend's
 `bucket`/`prefix` (or `key`) **unchanged** — the move is a refactor, not a
 state migration. Never delete `.terraform*/` or a local `terraform.tfstate`
 without asking (for a local backend, that file *is* the state). Move per-env
@@ -542,9 +597,10 @@ eight values set (detected vs. asked vs. defaulted); `VARS_MAP`/`BACKEND_MAP` as
 written, per id, with the files each resolves to (and, for a single-env repo,
 that both are deliberately empty); the backend type detected, whether the
 `tf:setup` block was emitted or omitted, and for gcs whether `gcloud` is
-present; layout decision (already conventional vs. migrated into `stacks/`
-vs. stopped on workspaces); legacy tasks removed, kept, or shimmed, each shim
-with its permission rule; `task tf:verify` PASS/FAIL lines with any check
+present; layout decision (`STACKS_DIR` value, already conventional vs.
+pointed at an existing dir vs. migrated via `git mv` vs. stopped on
+workspaces); legacy tasks removed, kept, or shimmed, each shim with its
+permission rule; `task tf:verify` PASS/FAIL lines with any check
 skipped for lack of network named explicitly; and the first commands for the
 user to run themselves (`task tf:setup:all STACK=…`, then `task tf:plan
 STACK=… VARS=…`). End with the caveats below.
@@ -572,8 +628,8 @@ STACK=… VARS=…`). End with the caveats below.
   `*.env` in the repo root is covered by the same gitignore line; that is
   intentional, not a narrower per-stack rule.
 - **`task tf:validate:all` can pass while validating nothing.** An empty
-  `stacks/` makes it a zero-iteration success — check the output, not
-  just the exit code.
+  `STACKS_DIR` (default `stacks/`) makes it a zero-iteration success — check
+  the output, not just the exit code.
 - **The plugin cache is version-keyed.** An edited asset is invisible until
   `plugins/dacbots/.claude-plugin/plugin.json`'s `version` is bumped and
   `/plugin marketplace update dacetplace` runs.

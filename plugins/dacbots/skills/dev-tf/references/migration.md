@@ -79,12 +79,44 @@ added for it.
 
 ## 3. Move the layout
 
-Only when root modules are not already at `stacks/<name>/`. That path is
-hardcoded — `STACK_DIR` is `stacks/{{.STACK}}` and stack discovery globs
-`stacks/*/` — so a repo whose modules sit under `terraform/`, `infra/`,
-or `live/` gets a proposed move into `stacks/`, not a pointer at its
-existing parent. This is a refactor, never a state migration — the
-checklist exists to keep it that way:
+`STACK_DIR` is `STACKS_DIR/{{.STACK}}` (`STACKS_DIR` a Taskfile var,
+defaulting to `stacks`), and stack discovery globs `STACKS_DIR/*/` — so the
+root every stack lives under is a single, repo-wide setting, not a hardcoded
+path.
+
+Discover two directories before deciding anything:
+
+- **`IMPLIED_STACKS_DIR`** — the one parent directory every root module found
+  in step 2 already shares (that module's own directory, if there is exactly
+  one).
+- **`IMPLIED_MAIN_STACK_DIR`** — the directory actually holding a root
+  module's own `.tf` files (one per module, if there are several).
+
+**They must never be the same directory** — one dir cannot be both the list
+of stacks and a stack's own files.
+
+- **Conforming** (they already differ — the common multi-stack case, and any
+  single-module repo whose module already sits in a named subdirectory): no
+  module needs to move. Renaming `IMPLIED_STACKS_DIR` itself is optional —
+  ask the user:
+  1. Do nothing — point `STACKS_DIR` at `IMPLIED_STACKS_DIR` as it already
+     is, by editing its default in the spliced Taskfile block (`STACKS_DIR:
+     '{{.STACKS_DIR | default "stacks"}}'`).
+  2. Rename to the conventional `stacks/` — `git mv <IMPLIED_STACKS_DIR>
+     stacks`, and `STACKS_DIR` stays the shipped default.
+- **Non-conforming** (they are the same — the common single-stack case,
+  usually the repo root holding the one module's `.tf` files directly): a
+  name is missing, not a directory. Infer `IMPLIED_STACK` from repo context
+  (the repo's own name is usually it, e.g. `tf-gcp-networking` implies
+  `gcp-networking`) and **always confirm it with the user**, never assume
+  silently. Then offer exactly two moves and let the user pick:
+  1. `STACKS_DIR='stacks'`, `STACK='<IMPLIED_STACK>'` — the standard layout;
+     the module moves two levels, into `stacks/<IMPLIED_STACK>/`.
+  2. `STACKS_DIR='.'`, `STACK='<IMPLIED_STACK>'` — the root stays
+     `STACKS_DIR`; the module moves one level, into `<IMPLIED_STACK>/`.
+
+Either way, this is a refactor, never a state migration — the checklist
+exists to keep it that way:
 
 1. **List every root module** and its proposed destination. Present the
    full list before moving anything.

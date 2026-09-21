@@ -392,10 +392,11 @@ tf_use() {
 # neither is the plan-only row.
 tf_stacks_list() {
   printf '%-14s %-9s %-9s %s\n' NAME WRITABLE BACKEND STATE
+  local root="${V_STACKS_DIR:-stacks}"
   local s first backend id bucket prefix inline
   for s in $V_STACKS; do
     first=1
-    for backend in "stacks/$s"/variables/*.backend.hcl; do
+    for backend in "$root/$s"/variables/*.backend.hcl; do
       [ -f "$backend" ] || continue
       id=$(basename "$backend" .backend.hcl)
       bucket=$(_hcl_string bucket "$backend")
@@ -408,9 +409,9 @@ tf_stacks_list() {
       fi
     done
     if [ "$first" = 1 ]; then
-      inline=$(BACKEND_INLINE_FILE "stacks/$s")
+      inline=$(BACKEND_INLINE_FILE "$root/$s")
       if [ -n "$inline" ]; then
-        printf '%-14s %-9s %-9s %s\n' "$s" yes "$s" "$(BACKEND_STATE "stacks/$s/$inline")"
+        printf '%-14s %-9s %-9s %s\n' "$s" yes "$s" "$(BACKEND_STATE "$root/$s/$inline")"
       else
         printf '%-14s %-9s %-9s %s\n' "$s" no '-' "local, plan-only"
       fi
@@ -673,7 +674,7 @@ tf_init_init() {
   }
 }
 
-# tf:validate:all -- tf:validate:local across every stack under stacks/.
+# tf:validate:all -- tf:validate:local across every stack under STACKS_DIR.
 tf_validate_all() {
   local s
   for s in $V_STACKS; do
