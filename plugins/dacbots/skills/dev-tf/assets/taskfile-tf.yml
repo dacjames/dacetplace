@@ -66,6 +66,8 @@ tf_stack_env: &tf_stack_env
   V_VARS_MAP: "{{.VARS_MAP}}"
   V_DATA_DIR: "{{.DATA_DIR}}"
   V_PLAN_FILE: "{{.PLAN_FILE}}"
+  V_NO_COLOR: "{{._NO_COLOR}}"
+  V_NO_LOCK: "{{._NO_LOCK}}"
 
 vars:
   # -- globals -- #
@@ -81,6 +83,14 @@ vars:
   LOCK_STASH: '{{.ROOT_DIR}}/{{.TMP}}/locks'
   PLUGIN_CACHE: '{{.ROOT_DIR}}/{{.TMP}}/plugin-cache'
   DEBUG_LOG: '{{.ROOT_DIR}}/{{.TMP}}/{{.STACK}}-debug-{{.TF}}.log'
+
+  # NO_COLOR=false to keep escape codes (e.g. piping through a colorizer);
+  # NO_LOCK=true to skip state locking (tf:plan only, for now) -- pass it if
+  # a stale lock is blocking a plan and you can't force-unlock.
+  NO_COLOR: '{{.NO_COLOR | default "true"}}'
+  NO_LOCK: '{{.NO_LOCK | default "false"}}'
+  _NO_COLOR: '{{if eq .NO_COLOR "true"}}-no-color{{end}}'
+  _NO_LOCK: '{{if eq .NO_LOCK "true"}}-lock=false{{end}}'
 
   # tf:setup inputs -- only read for the gcs conditional block below
   STATE_BUCKET: '__DEV_TF_STATE_BUCKET__'
@@ -348,7 +358,7 @@ tasks:
     dir: '{{.STACK_DIR}}'
     deps: [tmp:setup]
     cmds:
-      - 'TF_DATA_DIR={{.DATA_DIR_LOCAL}} {{.TF}} init -backend=false -input=false {{.CLI_ARGS}}'
+      - 'TF_DATA_DIR={{.DATA_DIR_LOCAL}} {{.TF}} init -backend=false -input=false {{._NO_COLOR}} {{.CLI_ARGS}}'
 
   tf:init:upgrade:ask:
     desc: Re-initialize with provider upgrades, rewriting the lock file (ai-ask gated)
@@ -363,18 +373,18 @@ tasks:
     desc: Rewrite tofu files to canonical format
     dir: '{{.STACK_DIR}}'
     cmds:
-      - '{{.TF}} fmt -recursive {{.CLI_ARGS}}'
+      - '{{.TF}} fmt -recursive {{._NO_COLOR}} {{.CLI_ARGS}}'
 
   tf:fmt:check:
     desc: Check tofu formatting without rewriting
     dir: '{{.STACK_DIR}}'
     cmds:
-      - '{{.TF}} fmt -recursive -check -diff {{.CLI_ARGS}}'
+      - '{{.TF}} fmt -recursive -check -diff {{._NO_COLOR}} {{.CLI_ARGS}}'
 
   tf:fmt:check:all:
     desc: Check tofu formatting across every stack and module
     cmds:
-      - '{{.TF}} fmt -recursive -check -diff .'
+      - '{{.TF}} fmt -recursive -check -diff {{._NO_COLOR}} .'
 
   tf:validate:
     desc: Validate the tofu configuration
@@ -382,14 +392,14 @@ tasks:
     deps:
       - task: tf:init:once
     cmds:
-      - '{{.TF}} validate {{.CLI_ARGS}}'
+      - '{{.TF}} validate {{._NO_COLOR}} {{.CLI_ARGS}}'
 
   tf:validate:local:
     desc: Validate the tofu configuration without contacting the remote backend
     dir: '{{.STACK_DIR}}'
     deps: [tf:init:local]
     cmds:
-      - 'TF_DATA_DIR={{.DATA_DIR_LOCAL}} {{.TF}} validate {{.CLI_ARGS}}'
+      - 'TF_DATA_DIR={{.DATA_DIR_LOCAL}} {{.TF}} validate {{._NO_COLOR}} {{.CLI_ARGS}}'
 
   tf:validate:all:
     desc: Offline-validate every stack under {{.STACKS_DIR}}/
@@ -477,7 +487,7 @@ tasks:
     cmds:
       - task: tf:vars:assert
       - task: tf:init:once
-      - '{{.TF}} plan {{.VAR_FILES}} -out {{.PLAN_FILE}} {{.CLI_ARGS}}'
+      - '{{.TF}} plan {{._NO_COLOR}} {{._NO_LOCK}} {{.VAR_FILES}} -out {{.PLAN_FILE}} {{.CLI_ARGS}}'
 
   tf:plan:all:
     desc: Plan {{.STACK}} once per name in VARS_MAP it has, or once with its default VARS
@@ -511,7 +521,7 @@ tasks:
     cmds:
       - task: tf:vars:assert
       - task: tf:init:once
-      - '{{.TF}} plan {{.VAR_FILES}} -out {{.PLAN_FILE}} {{.CLI_ARGS}}'
+      - '{{.TF}} plan {{._NO_COLOR}} {{._NO_LOCK}} {{.VAR_FILES}} -out {{.PLAN_FILE}} {{.CLI_ARGS}}'
       - |
         echo
         echo "log: {{.DEBUG_LOG}} ($(wc -l < {{.DEBUG_LOG}} | tr -d ' ') lines)"
@@ -525,7 +535,7 @@ tasks:
     dir: '{{.STACK_DIR}}'
     cmds:
       - task: tf:vars:assert
-      - '{{.TF}} show {{.PLAN_FILE}} {{.CLI_ARGS}}'
+      - '{{.TF}} show {{._NO_COLOR}} {{.PLAN_FILE}} {{.CLI_ARGS}}'
 
   # ---- misc ---- #
 
@@ -535,7 +545,7 @@ tasks:
     deps:
       - task: tf:init:once
     cmds:
-      - '{{.TF}} output {{.CLI_ARGS}}'
+      - '{{.TF}} output {{._NO_COLOR}} {{.CLI_ARGS}}'
 
   tf:clean:
     desc: Remove every toolchain's provider dir, the lock file and stash, and saved plans
@@ -554,7 +564,7 @@ tasks:
       - task: tf:toolchain:assert:tofu
       - task: tf:vars:assert
       - task: tf:init:once
-      - '{{.TF}} apply {{.PLAN_FILE}} {{.CLI_ARGS}}'
+      - '{{.TF}} apply {{._NO_COLOR}} {{.PLAN_FILE}} {{.CLI_ARGS}}'
 
   tf:refresh:ask:
     desc: Reconcile state with reality without changing infrastructure (ai-ask gated)
@@ -564,7 +574,7 @@ tasks:
       - task: tf:toolchain:assert:tofu
       - task: tf:vars:assert
       - task: tf:init:once
-      - '{{.TF}} apply -refresh-only {{.VAR_FILES}} {{.CLI_ARGS}}'
+      - '{{.TF}} apply -refresh-only {{._NO_COLOR}} {{.VAR_FILES}} {{.CLI_ARGS}}'
 
   # Flags go before the lock id: force-unlock takes exactly one positional argument.
   tf:force-unlock:ask:
@@ -587,7 +597,7 @@ tasks:
       - task: tf:stack:assert
       - task: tf:toolchain:assert:tofu
       - task: tf:vars:assert
-      - '{{.TF}} destroy {{.VAR_FILES}} {{.CLI_ARGS}}'
+      - '{{.TF}} destroy {{._NO_COLOR}} {{.VAR_FILES}} {{.CLI_ARGS}}'
 
   # ---- verify ---- #
 

@@ -123,7 +123,7 @@ USE_VARS() {
   local ENV_FILE="$1"
 
   [ -f "$ENV_FILE" ] || exit 0
-  sed -n 's/^[ \t]*VARS[ \t]*=[ \t]*//p' "$ENV_FILE" | tail -n 1 | sed 's/[ \t]*$//'
+  sed -n 's/^[[:space:]]*VARS[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" | tail -n 1 | sed 's/[[:space:]]*$//'
 }
 
 # The -var-file=... flags for a resolved VARS. Runs from STACK_DIR because the
@@ -186,7 +186,7 @@ USE_BACKEND() {
   local ENV_FILE="$1"
 
   [ -f "$ENV_FILE" ] || exit 0
-  sed -n 's/^[ \t]*BACKEND[ \t]*=[ \t]*//p' "$ENV_FILE" | tail -n 1 | sed 's/[ \t]*$//'
+  sed -n 's/^[[:space:]]*BACKEND[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" | tail -n 1 | sed 's/[[:space:]]*$//'
 }
 
 # See VARS_RESOLVED -- same lookup, over BACKEND_MAP.
@@ -346,7 +346,7 @@ tf_use() {
   mkdir -p "$V_TMP"
   local new="$V_TMP/$(basename "$file").new"
   if [ -f "$file" ]; then
-    grep -v '^[ \t]*\(VARS\|BACKEND\)[ \t]*=' "$file" > "$new" || true
+    grep -v '^[[:space:]]*\(VARS\|BACKEND\)[[:space:]]*=' "$file" > "$new" || true
   else
     : > "$new"
   fi
@@ -664,9 +664,9 @@ tf_setup() {
 tf_init_init() {
   local init
   if [ "$(BACKEND_KIND "$V_BACKEND_FILE")" = config ]; then
-    init="$V_TF init -input=false -backend-config=$V_BACKEND_FILE"
+    init="$V_TF init -input=false -backend-config=$V_BACKEND_FILE $V_NO_COLOR"
   else
-    init="$V_TF init -input=false"
+    init="$V_TF init -input=false $V_NO_COLOR"
   fi
   $init "$@" || {
     echo "init failed; retrying with -reconfigure (stale backend cache in $V_DATA_DIR?)" >&2
@@ -749,7 +749,7 @@ tf_use_clear() {
   fi
   mkdir -p "$V_TMP"
   local new="$V_TMP/$(basename "$file").new"
-  grep -v '^[ \t]*\(VARS\|BACKEND\)[ \t]*=' "$file" > "$new" || true
+  grep -v '^[[:space:]]*\(VARS\|BACKEND\)[[:space:]]*=' "$file" > "$new" || true
   if [ -s "$new" ]; then
     mv "$new" "$file"
     echo "removed VARS and BACKEND from $file"
