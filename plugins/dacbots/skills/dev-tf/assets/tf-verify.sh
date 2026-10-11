@@ -10,7 +10,9 @@
 # Prints one line per check, "PASS <n> ..." or "FAIL <n> ...: <reason>",
 # and exits non-zero if any check FAILs. `--offline` skips checks 10 and
 # 11 (the tf:use round trip and tf:fmt:check:all / tf:validate:all), the
-# only two that shell out to tofu/terraform itself.
+# only two that shell out to tofu/terraform itself. The secrets checks (12
+# and 13) never call gcloud: tf:secrets:assert is the offline guard, and
+# the others are only checked for existing.
 
 set -uo pipefail
 
@@ -154,14 +156,14 @@ check1() {
 }
 
 # ---------------------------------------------------------------------
-# 2. scripts/tf-stack.sh help lists exactly the expected 31 function
+# 2. scripts/tf-stack.sh help lists exactly the expected 62 function
 # names -- catches a truncated copy. This set is the frozen ABI (dev-tf
-# plan section 4): a byte-for-byte copy always carries all 31, regardless
+# plan section 4): a byte-for-byte copy always carries all 62, regardless
 # of which backend/toolchain the target repo uses, and regardless of
 # whether its stacks keep their backends in .backend.hcl files or inline.
 # ---------------------------------------------------------------------
 check2() {
-  local label="2 $SCRIPT help lists exactly 31 functions"
+  local label="2 $SCRIPT help lists exactly 62 functions"
   if [ ! -x "$SCRIPT" ] && [ ! -f "$SCRIPT" ]; then
     fail "$label" "$SCRIPT not found"
     return
@@ -199,13 +201,44 @@ tf_use_clear
 tf_validate_all
 tf_vars
 tf_vars_assert
+SECRETS_DISCOVER
+_hcl_blocks
+_secrets_add_version
+_secrets_check_ignored
+_secrets_create
+_secrets_dest_path
+_secrets_dir_clean
+_secrets_encode_inline
+_secrets_exists
+_secrets_fetch
+_secrets_gitignore
+_secrets_gitignore_line
+_secrets_label
+_secrets_latest
+_secrets_local_present
+_secrets_local_version
+_secrets_manifest
+_secrets_need_gcloud
+_secrets_norm
+_secrets_not_found
+_secrets_prepare
+_secrets_read_file
+_secrets_rows
+_secrets_variables
+_secrets_work_init
+tf_secrets
+tf_secrets_assert
+tf_secrets_new
+tf_secrets_pull
+tf_secrets_push
+tf_secrets_setup
 NAMES
 )
   local expected_sorted expected_count
   expected_sorted=$(printf '%s\n' "$expected" | sort)
   expected_count=$(printf '%s\n' "$expected_sorted" | grep -c .)
-  if [ "$expected_count" -ne 31 ]; then
-    fail "$label" "internal error in tf-verify.sh: expected list has $expected_count names, not 31"
+  if [ "$expected_count" -ne 62 ]; then
+    fail "$label" "internal error in tf-verify.sh: expected list has $expected_count names, not 62"
     return
   fi
 
@@ -265,6 +298,12 @@ tf:apply:ask
 tf:refresh:ask
 tf:force-unlock:ask
 tf:destroy:deny
+tf:secrets
+tf:secrets:setup
+tf:secrets:new:ask
+tf:secrets:pull:ask
+tf:secrets:push:ask
+tf:secrets:assert
 tf:verify'
 
 GUARD_TASKS='tf:stack:assert
@@ -764,6 +803,113 @@ check11() {
   fi
 }
 
+# ---------------------------------------------------------------------
+# 12. tf:secrets:assert, per stack x present id. It is the offline guard
+# in front of every planning task, so it must work with no cloud. A stack
+# that declares no secret (no variable with sensitive = true or ephemeral
+# = true) must pass it outright. A stack that does declare one may
+# legitimately fail it -- "required secrets are not on this machine" is
+# the guard doing its job on a clone that has not pulled yet -- but any
+# other failure (a discovery error, a task that does not run) is an
+# install bug.
+# ---------------------------------------------------------------------
+check12() {
+  local label="12 task tf:secrets:assert per stack x id (offline)"
+  local stacks
+  stacks=$(list_stacks)
+  if [ -z "$stacks" ]; then
+    fail "$label" "no stacks found (task tf:stacks:list printed none)"
+    return
+  fi
+
+  local bad="" probed=0 s stack_dir map ids id declares out rc
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    stack_dir=$(stack_dir_for "$s")
+    map=$(task tf:vars:map 2>/dev/null)
+    ids=""
+    if [ -n "$map" ]; then
+      ids=$(bash "$SCRIPT" VARS_IDS_PRESENT "$stack_dir" "$map" 2>/dev/null)
+    elif [ -e "$stack_dir/variables/$s.tfvars" ]; then
+      ids="$s:variables/$s.tfvars"
+    fi
+    [ -n "$ids" ] || continue
+
+    declares=no
+    # shellcheck disable=SC2086
+    if grep -qE '^[[:space:]]*(sensitive|ephemeral)[[:space:]]*=[[:space:]]*true' "$stack_dir"/*.tf 2>/dev/null; then
+      declares=yes
+    fi
+
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      probed=1
+      out=$(task tf:secrets:assert STACK="$s" VARS="$id" 2>&1); rc=$?
+      [ "$rc" -eq 0 ] && continue
+      if [ "$declares" = yes ] && printf '%s\n' "$out" | grep -q 'required secrets are not on this machine'; then
+        continue
+      fi
+      bad="$bad $s/$id:tf:secrets:assert-exited-$rc"
+    done <<IDS
+$ids
+IDS
+  done <<STACKS
+$stacks
+STACKS
+
+  if [ "$probed" = 0 ]; then
+    fail "$label" "no stack has a resolvable VARS id to probe with"
+  elif [ -n "$bad" ]; then
+    fail "$label" "$bad"
+  else
+    pass "$label"
+  fi
+}
+
+# ---------------------------------------------------------------------
+# 13. VAR_FILES and the secret tfvars. The current one goes last, exactly
+# once, whether or not the VARS_MAP entry names it; a glob never loads a
+# *.secret.tfvars. Probed on a throwaway directory so no real stack, and
+# no real secret file, is touched.
+# ---------------------------------------------------------------------
+check13() {
+  local label="13 VAR_FILES puts the secret tfvars last, once; no glob loads one"
+  local work rc=0
+  work=$(mktemp -d "${TMPDIR:-/tmp}/tf-verify.XXXXXX") || {
+    fail "$label" "could not create a scratch directory"
+    return
+  }
+  mkdir -p "$work/variables"
+  : > "$work/variables/dev.tfvars"
+  : > "$work/variables/dev.secret.tfvars"
+  : > "$work/variables/prod.secret.tfvars"
+
+  local want='-var-file=variables/dev.tfvars -var-file=variables/dev.secret.tfvars ' got bad=""
+
+  # a glob broad enough to match both secret tfvars
+  got=$(bash "$SCRIPT" VAR_FILES "$work" 'dev:variables/*.tfvars' variables/dev.secret.tfvars) || rc=$?
+  [ "$got" = "$want" ] || bad="$bad glob=[$got]"
+
+  # the current secret tfvars named in the map entry itself (a hand wiring,
+  # or one left by the older dev-secrets skill), listed last, and listed first
+  got=$(bash "$SCRIPT" VAR_FILES "$work" 'dev:variables/dev.tfvars,variables/dev.secret.tfvars' variables/dev.secret.tfvars) || rc=$?
+  [ "$got" = "$want" ] || bad="$bad explicit-last=[$got]"
+  got=$(bash "$SCRIPT" VAR_FILES "$work" 'dev:variables/dev.secret.tfvars,variables/dev.tfvars' variables/dev.secret.tfvars) || rc=$?
+  [ "$got" = "$want" ] || bad="$bad explicit-first=[$got]"
+
+  # no secret tfvars argument: nothing secret is loaded, whatever the map says
+  got=$(bash "$SCRIPT" VAR_FILES "$work" 'dev:variables/*.tfvars') || rc=$?
+  [ "$got" = '-var-file=variables/dev.tfvars ' ] || bad="$bad no-arg=[$got]"
+
+  rm -rf "$work"
+  [ "$rc" -eq 0 ] || bad="$bad VAR_FILES-exited-non-zero"
+  if [ -n "$bad" ]; then
+    fail "$label" "$bad"
+  else
+    pass "$label"
+  fi
+}
+
 # -- run -- #
 
 check1
@@ -777,5 +923,7 @@ check8
 check9
 check10
 check11
+check12
+check13
 
 exit "$FAILED"

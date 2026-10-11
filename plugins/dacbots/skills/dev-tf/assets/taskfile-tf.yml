@@ -66,6 +66,13 @@ tf_stack_env: &tf_stack_env
   V_VARS_MAP: "{{.VARS_MAP}}"
   V_DATA_DIR: "{{.DATA_DIR}}"
   V_PLAN_FILE: "{{.PLAN_FILE}}"
+  V_SECRETS_PROJECT: "{{.SECRETS_PROJECT}}"
+  V_SECRET_PREFIX: "{{.SECRET_PREFIX}}"
+  V_SECRETS_DIR: "{{.SECRETS_DIR}}"
+  V_SECRETS_FILE: "{{.SECRETS_FILE}}"
+  V_SECRET_TFVARS: "{{.SECRET_TFVARS}}"
+  V_SECRETS_TF: "{{.SECRETS_TF}}"
+  V_USER_WORKING_DIR: "{{.USER_WORKING_DIR}}"
   V_NO_COLOR: "{{._NO_COLOR}}"
   V_NO_LOCK: "{{._NO_LOCK}}"
 
@@ -139,10 +146,30 @@ vars:
   # tf-stack.sh)
   _VARS: '{{.VARS | default .USE_VARS | default .VARS_DEFAULT }}'
   VARS_ID: '{{._VARS | splitList ":" | first | trim}}'
+
+  # secrets interface: a variable with sensitive = true or ephemeral = true in the
+  # stack's .tf is a secret, one Secret Manager secret per variable, named
+  # <SECRET_PREFIX><stack>-<vars_id>-<var> in SECRETS_PROJECT. The optional
+  # SECRETS_FILE only moves a secret's file or id and is never written by a task.
+  # tf:secrets:pull:ask writes SECRET_TFVARS and the file secrets. A file secret
+  # lands in SECRETS_DIR/<stack>/<vars_id>/ unless the manifest names a path
+  # (./, ../ or /). SECRETS_DIR is the one directory for the whole repo, relative
+  # to the repo root (no absolute path, no ..), and git-ignored as /<SECRETS_DIR>/.
+  # SECRET_TFVARS, SECRETS_FILE and SECRETS_TF (where tf:secrets:new:ask declares
+  # variables) are stack-relative. VAR_FILES (see VAR_FILES in tf-stack.sh) ends
+  # with SECRET_TFVARS when it exists.
+  # SECRETS_PROJECT defaults to BOOTSTRAP_PROJECT; set it (here or on the CLI)
+  # when the secrets live in another project or BOOTSTRAP_PROJECT is empty.
+  SECRETS_PROJECT: '{{.SECRETS_PROJECT | default .BOOTSTRAP_PROJECT}}'
+  SECRET_PREFIX: '{{.SECRET_PREFIX | default ""}}'
+  SECRETS_DIR: '{{.SECRETS_DIR | default "secrets"}}'
+  SECRETS_FILE: 'variables/{{.VARS_ID}}.secrets.hcl'
+  SECRET_TFVARS: 'variables/{{.VARS_ID}}.secret.tfvars'
+  SECRETS_TF: 'secrets.tf'
   VARS_RESOLVED:
     sh: "scripts/tf-stack.sh VARS_RESOLVED '{{._VARS}}' '{{.VARS_MAP}}'"
   VAR_FILES:
-    sh: "scripts/tf-stack.sh VAR_FILES '{{.STACK_DIR}}' '{{.VARS_RESOLVED}}'"
+    sh: "scripts/tf-stack.sh VAR_FILES '{{.STACK_DIR}}' '{{.VARS_RESOLVED}}' '{{.SECRET_TFVARS}}'"
 
   # backend interface: BACKEND=<id> (CLI) picks a name from BACKEND_MAP;
   # unset falls back through USE_BACKEND to BACKEND_DEFAULT (VARS_ID, not
@@ -479,6 +506,66 @@ tasks:
     cmds:
       - scripts/tf-stack.sh tf_stacks_list
 
+  # ---- secrets ---- #
+
+  # tf:secrets:* -- a stack's secrets in Secret Manager; see docs/tf-stack.md.
+  # setup is once per repo; new ID=<var> [FILE=<path>] creates a secret and declares
+  # its variable, sensitive and ephemeral; pull:ask fetches every secret the stack
+  # needs; push:ask VAR=<var> [FILE=<path>] stores one, value on stdin when there is
+  # no file (FILE is relative to where task was run); assert is the offline guard in
+  # front of every task whose tofu command evaluates the variables.
+  tf:secrets:
+    desc: Show the secrets {{.STACK}} needs for VARS, and which are in the cloud and on this machine
+    silent: false
+    env: *tf_stack_env
+    cmds:
+      - task: tf:vars:assert
+      - scripts/tf-stack.sh tf_secrets
+
+  tf:secrets:setup:
+    desc: Enable Secret Manager in {{.SECRETS_PROJECT}}, check access, gitignore the secret files (idempotent)
+    silent: false
+    env: *tf_stack_env
+    cmds:
+      - scripts/tf-stack.sh tf_secrets_setup
+
+  tf:secrets:new:ask:
+    desc: Create the secret ID=<var> in {{.SECRETS_PROJECT}}, declare its variable if missing, then pull (ai-ask gated)
+    silent: false
+    interactive: true
+    env: *tf_stack_env
+    preconditions:
+      - sh: test -n "{{.ID}}"
+        msg: 'ID is required -- the variable name: task tf:secrets:new:ask STACK={{.STACK}} VARS={{.VARS_ID}} ID=<var> [FILE=<path>]'
+    cmds:
+      - task: tf:vars:assert
+      - scripts/tf-stack.sh tf_secrets_new '{{.ID}}' '{{.FILE}}'
+
+  tf:secrets:pull:ask:
+    desc: Fetch the secrets {{.STACK}} needs and write the secret tfvars and secret files (ai-ask gated)
+    silent: false
+    env: *tf_stack_env
+    cmds:
+      - task: tf:vars:assert
+      - scripts/tf-stack.sh tf_secrets_pull
+
+  tf:secrets:push:ask:
+    desc: Store the secret VAR=<var> from FILE=<path>, its file, or stdin, as a new version (ai-ask gated)
+    silent: false
+    env: *tf_stack_env
+    preconditions:
+      - sh: test -n "{{.VAR}}"
+        msg: 'VAR is required -- the variable name: task tf:secrets:push:ask STACK={{.STACK}} VARS={{.VARS_ID}} VAR=<var> [FILE=<path>]'
+    cmds:
+      - task: tf:vars:assert
+      - scripts/tf-stack.sh tf_secrets_push '{{.VAR}}' '{{.FILE}}'
+
+  tf:secrets:assert:
+    desc: Fail unless every required secret of {{.STACK}} is on this machine (offline)
+    env: *tf_stack_env
+    cmds:
+      - scripts/tf-stack.sh tf_secrets_assert
+
   # ---- plan ---- #
 
   tf:plan:
@@ -486,6 +573,7 @@ tasks:
     dir: '{{.STACK_DIR}}'
     cmds:
       - task: tf:vars:assert
+      - task: tf:secrets:assert
       - task: tf:init:once
       - '{{.TF}} plan {{._NO_COLOR}} {{._NO_LOCK}} {{.VAR_FILES}} -out {{.PLAN_FILE}} {{.CLI_ARGS}}'
 
@@ -520,6 +608,7 @@ tasks:
       TF_LOG_PATH: '{{.DEBUG_LOG}}'
     cmds:
       - task: tf:vars:assert
+      - task: tf:secrets:assert
       - task: tf:init:once
       - '{{.TF}} plan {{._NO_COLOR}} {{._NO_LOCK}} {{.VAR_FILES}} -out {{.PLAN_FILE}} {{.CLI_ARGS}}'
       - |
@@ -563,8 +652,9 @@ tasks:
       - task: tf:stack:assert
       - task: tf:toolchain:assert:tofu
       - task: tf:vars:assert
+      - task: tf:secrets:assert
       - task: tf:init:once
-      - '{{.TF}} apply {{._NO_COLOR}} {{.PLAN_FILE}} {{.CLI_ARGS}}'
+      - '{{.TF}} apply {{._NO_COLOR}} {{.VAR_FILES}} {{.PLAN_FILE}} {{.CLI_ARGS}}'
 
   tf:refresh:ask:
     desc: Reconcile state with reality without changing infrastructure (ai-ask gated)
@@ -573,6 +663,7 @@ tasks:
       - task: tf:stack:assert
       - task: tf:toolchain:assert:tofu
       - task: tf:vars:assert
+      - task: tf:secrets:assert
       - task: tf:init:once
       - '{{.TF}} apply -refresh-only {{._NO_COLOR}} {{.VAR_FILES}} {{.CLI_ARGS}}'
 
@@ -597,6 +688,7 @@ tasks:
       - task: tf:stack:assert
       - task: tf:toolchain:assert:tofu
       - task: tf:vars:assert
+      - task: tf:secrets:assert
       - '{{.TF}} destroy {{._NO_COLOR}} {{.VAR_FILES}} {{.CLI_ARGS}}'
 
   # ---- verify ---- #

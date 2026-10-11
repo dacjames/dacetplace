@@ -23,14 +23,19 @@ What it adds:
   environment, an apply against a stack with no remote state — each
   refused with a message naming the real problem, instead of reaching
   tofu as `bucket must be set` or a plan that creates everything.
+- **Secrets without a list to maintain.** A variable marked `sensitive` or
+  `ephemeral` is a secret, stored in Secret Manager and pulled to a
+  gitignored tfvars file before a plan; a plan that needs one it does not
+  have is refused. See [Secrets](#secrets).
 - **No collisions.** `TF_DATA_DIR` is keyed by toolchain and backend, the
   saved plan file by stack, vars, backend and toolchain — so planning prod
   after dev cannot leave `apply` holding the wrong plan.
 
 Needs [go-task](https://taskfile.dev) and `tofu`. Nothing else to plan or
 apply against a state store that already exists; `gcloud` only if this
-repo carries the `tf:setup` tasks that create its GCS state buckets;
-`terraform` + `tfenv` only if you want the plan-only second toolchain.
+repo carries the `tf:setup` tasks that create its GCS state buckets, or for
+the secrets tasks (`tf:secrets:*`); `terraform` + `tfenv` only if you want
+the plan-only second toolchain.
 
 ## Arguments go after the task name
 
@@ -67,9 +72,10 @@ RESOLVED   dev:variables/common.tfvars,…       SOURCE     VARS_ID=dev
 VARS_ID    dev                                 BACKEND_ID dev
 BACKEND    dev                                 FILE       …/variables/dev.backend.hcl
 PLAN       …/app-dev-dev-tofu.tfplan           FORMAT     backend config, …
-FILES                                          STATE      gs://…-tfstate-dev/app
-  variables/common.tfvars                      WRITABLE   yes
-  variables/dev-extra.tfvars                   DATA_DIR   …/.terraform-tofu-dev
+SECRETS    variables/dev.secrets.hcl (absent)  STATE      gs://…-tfstate-dev/app
+FILES                                          WRITABLE   yes
+  variables/common.tfvars                      DATA_DIR   …/.terraform-tofu-dev
+  variables/dev-extra.tfvars
   variables/dev.tfvars
 ```
 
@@ -340,6 +346,279 @@ file cannot be split the same way (fixed path), so
 `tf:toolchain:use:ask` stashes the outgoing lock under the temp dir and
 restores the incoming one.
 
+## Secrets
+
+Infrastructure needs keys and credentials that cannot live in git. The rule
+here is **one secret per variable**: a variable declared `sensitive = true`
+or `ephemeral = true` in the stack's `.tf` files *is* a secret, kept in
+[Secret Manager](https://cloud.google.com/secret-manager) in
+`SECRETS_PROJECT` (by default `BOOTSTRAP_PROJECT`, the project that owns the
+state bucket). There is no list of secrets to keep in step with the code,
+because the code is the list. A clean clone finds out what it needs with
+`task tf:secrets`, fetches it with `task tf:secrets:pull:ask`, and plans.
+
+```hcl
+variable "db_password" {
+  type      = string
+  sensitive = true          # either flag makes it a secret
+  ephemeral = true          # and this one keeps it out of state: see below
+}                           # no default: a plan refuses to run without it
+
+variable "api_token" {
+  type      = string
+  sensitive = true
+  ephemeral = true
+  default   = null          # optional: pulled if it exists, skipped if not
+}
+```
+
+Secret variables are strings. A secret with any other `type` is an error;
+store JSON in the string and `jsondecode(var.x)` in the configuration. Its
+default is either absent (required) or `null` (optional); any other default
+is an error, because the value would then be in git.
+
+### The first secret
+
+```
+task tf:secrets:setup                                      # once per repo: enable the API, check access
+task tf:secrets:new:ask STACK=app VARS=dev ID=db_password  # create it, declare the variable, pull
+task tf:secrets STACK=app VARS=dev                         # what the stack needs and where each is
+task tf:plan    STACK=app VARS=dev                         # plans with the pulled values
+```
+
+Creating a cloud secret is a write, so `tf:secrets:new:ask` carries the
+`:ask` suffix and an agent's permission rule for `task *:ask` stops to
+confirm it, as it does for push and pull. It prompts for the value twice
+with the input hidden, or reads it from `FILE=<path>` (relative to the directory you run `task` in) or
+stdin. If no variable called `ID` exists it appends one to
+`stacks/<stack>/secrets.tf`: `sensitive` and `ephemeral`, no default, so
+required. A variable that exists but is neither sensitive nor ephemeral is
+refused: mark it first. A secret that already exists is refused too, and
+the message names the push command that adds a version instead.
+
+On a new machine, `tf:secrets:pull:ask` is all that is needed. Creating
+secrets and adding versions takes `roles/secretmanager.admin` on the
+project; pulling takes only `roles/secretmanager.secretAccessor`. All of it
+drives `gcloud`, which must be installed and authenticated.
+
+### Ephemeral by default
+
+`sensitive = true` hides a value in plan and apply output and does nothing
+else: tofu still writes it in plaintext to state, to the saved plan file,
+and to `show -json`. `ephemeral = true` keeps it out of all three. That is
+why `tf:secrets:new:ask` declares both.
+
+The cost is where the value may go. An ephemeral value, and anything
+computed from it, may feed only:
+
+- a `provider` block, e.g. `access_token = var.token`;
+- a write-only argument, one of the `*_wo` attributes such as
+  `google_secret_manager_secret_version.secret_data_wo` or
+  `google_sql_user.password_wo`. The provider sends it when the resource is
+  created and whenever the matching `*_wo_version` changes, and never
+  stores it;
+- an `ephemeral` resource, a `provisioner` or a `connection` block;
+- locals, and child-module outputs marked `ephemeral = true` (a root module
+  cannot have one), that carry it on to one of the above.
+
+Anywhere else, a regular resource argument for example, the plan fails with
+`Ephemeral value used in non-ephemeral context`. When a value has to go
+into such an argument (an attribute with no `*_wo` form), delete
+`ephemeral = true` from its variable by hand and keep `sensitive = true`.
+It still works as a secret, but its value then lands in state and in every
+saved plan file, where anyone who can read the state bucket or the temp dir
+can read it.
+
+A saved plan holds no ephemeral value, so tofu needs it again at apply.
+`tf:apply:ask` therefore passes the same var files as the plan, the secret
+tfvars included. tofu refuses a non-ephemeral value that differs from the
+one saved in the plan (`Mismatch between input and plan variable value`)
+and takes ephemeral ones as given.
+
+**Version floor.** Ephemeral input variables need OpenTofu 1.11 or later
+(Terraform 1.10). `tf:secrets:new:ask` writes `ephemeral = true` into the
+variable it declares and does not check the toolchain, so on an older one
+the next `validate` fails on the unknown argument. A stack that declares an
+ephemeral variable should say so in `required_version` (`>= 1.11.0` for
+tofu); a stack on an older tofu can still use secrets by declaring its
+variables `sensitive = true` alone, by hand, and accepting the plaintext in
+state described above.
+
+### Where things live
+
+```
+stacks/<stack>/
+  secrets.tf                  committed   variables declared by tf:secrets:new:ask (any .tf will do)
+  variables/
+    dev.tfvars                committed
+    dev.secrets.hcl           committed   the manifest: optional, written by hand, never holds values
+    dev.secret.tfvars         IGNORED     written by tf:secrets:pull:ask, mode 600
+secrets/                      IGNORED     the repo's one home of file secrets (SECRETS_DIR), at the root
+  <stack>/<vars_id>/          IGNORED     one directory per stack and vars id, so file names never collide
+```
+
+There is one `SECRETS_DIR` for the whole repo, relative to the repo root and
+`secrets` by default. It must not be empty, absolute or contain a `..`
+segment, and the tasks refuse it otherwise. Both ignored paths are appended
+to the root `.gitignore` by `tf:secrets:setup` and `tf:secrets:pull:ask`
+when missing: `*.secret.tfvars`, and `/secrets/` (`/<SECRETS_DIR>/`),
+anchored to the root so a module directory that happens to be called
+`secrets/` is not ignored. The pull also asks git (`git check-ignore`) about
+every file it is about to write and **refuses any that git would not
+ignore**, naming the path and the line to add; that check is what makes it
+safe for a manifest to point a file somewhere other than `SECRETS_DIR`.
+
+`<vars_id>.secret.tfvars` is passed to tofu as a `-var-file` after the
+files `VARS` names, so it wins, whenever it exists; `task tf:vars` lists it
+under `FILES`. It is named explicitly, and a `VARS_MAP` glob never loads a
+`*.secret.tfvars`: prod's list ends at `variables/prod.tfvars` and would
+miss it, dev's `variables/dev*.tfvars` would match it in the middle, and a
+broader glob would pick up another environment's.
+
+So **do not name the current secret tfvars in `VARS_MAP`**; it is added for
+you, once, last. If a line does carry it, it is skipped in place and added
+at the end, so nothing is passed twice. `tf:vars:assert` does not require
+it to exist either, so a clean clone can still pull. Any other
+`*.secret.tfvars` named in a map is never loaded at all; `tf:vars:assert`
+prints a note naming it.
+
+### Names
+
+The Secret Manager id is `<SECRET_PREFIX><stack>-<vars_id>-<variable>`, in
+`SECRETS_PROJECT`. So `db_password` for `STACK=app VARS=dev` is
+`app-dev-db_password`. Variable names pass through unchanged, and the id is
+always computed from the three parts, never parsed back. Set
+`SECRET_PREFIX` in the Taskfile to share a project between repos. Secret
+Manager ids allow `A-Za-z0-9_-` and at most 255 characters; a stack or
+vars_id outside that is reported with the id to set in the manifest
+instead.
+
+### The manifest
+
+`variables/<vars_id>.secrets.hcl` changes where a secret lands or which id
+backs it. Nothing is required in it: a secret variable with no block is an
+inline secret under its convention id.
+
+```hcl
+secret "db_password" {
+  id = "legacy-db-pw"              # another Secret Manager id, still inline
+}
+
+secret "sa_key" {
+  file = "sa.json"                 # file secret: written to secrets/<stack>/<vars_id>/sa.json
+}
+
+secret "tls_cert" {
+  file = "../../certs/dev.pem"     # ./, ../ or / means a path, relative to the stack
+}
+
+secret "kubeconfig" {
+  file = "../../.kube/config"      # not a variable: a file some other tool reads
+}
+```
+
+Two kinds:
+
+- **inline** (the default): the value goes into `dev.secret.tfvars` as
+  `db_password = "..."`.
+- **file** (`file = ...`): the payload is written to the path, mode 600, and
+  the variable's value is that path, relative to the stack directory,
+  because tofu runs there. A bare name goes under
+  `SECRETS_DIR/<stack>/<vars_id>/` at the repo root, so two stacks, or two
+  vars ids, can both say `file = "sa.json"`; for `stacks/app` and
+  `VARS=dev` the variable holds `../../secrets/app/dev/sa.json`. A path
+  starting `./`, `../` or `/` is used as written, relative to the stack, and
+  must be ignored by git. Parent directories are created, mode 700.
+
+A file secret's variable holds only the path, so `sensitive` and
+`ephemeral` protect the path, not the file. What happens to the content is
+up to the configuration: `file(var.sa_key)` in a `provider` block or a
+write-only argument stays out of state, and in a regular argument it is
+stored there. If the variable is ephemeral, tofu treats `file(var.sa_key)`
+as ephemeral too and refuses the regular argument, which is one more reason
+to keep the flag.
+
+Only `file` and `id` exist; anything else is an error. So is a block for a
+variable that is neither sensitive nor ephemeral (mark it), and a block
+whose label is not a variable and has no `file` (there is nowhere to put
+it). A block with a `file` whose label is not a variable is a **file-only
+secret**: pulled to its path, nothing added to the tfvars, and always
+required. Problems anywhere in the manifest or the variables are reported
+together and refuse every `tf:secrets` task and every plan.
+
+### The tasks
+
+`tf:secrets:setup` is the one-time step; `tf:secrets:new:ask` the usual way
+to add a secret; the rest are what you run day to day. Like the other `:ask`
+tasks, `new:ask`, `pull:ask` and `push:ask` write and are meant to be
+confirmed.
+
+| Task | What it does |
+| --- | --- |
+| `tf:secrets:setup` | Enable Secret Manager on `SECRETS_PROJECT` if it is not, check the caller can list secrets (and say which roles are needed if not), gitignore the secret files. Idempotent; the second run only reads |
+| `tf:secrets:new:ask` | `ID=<var>` and optionally `FILE=<path>`. Create the secret, declare the variable (sensitive, ephemeral) in `secrets.tf` if it is not declared, then pull. Interactive |
+| `tf:secrets` | Report: the project, manifest and tfvars paths, then a row per secret with its kind, whether it is required, its id and destination (from the repo root), its latest version in the cloud (`CLOUD`) and whether it is here (`LOCAL`: `yes`, `no`, or `stale` when the cloud has a newer version than the one pulled) |
+| `tf:secrets:pull:ask` | Fetch every secret and write `dev.secret.tfvars` and the file secrets. All or nothing: nothing is written if a required secret is missing, a fetch fails, or a destination is not ignored. Optional secrets that do not exist are skipped with a note |
+| `tf:secrets:push:ask` | `VAR=<var>`, and optionally `FILE=<path>`. Store a secret: create it, or add a version if the bytes differ from the latest. The source is `FILE`, else a file secret's own path, else stdin |
+| `tf:secrets:assert` | Offline guard; fails if a required secret is not on this machine. Runs before every task whose tofu command evaluates the variables (see [The guards](#the-guards)) |
+
+An inline value goes in on stdin, byte for byte; use `printf`, not `echo`,
+which adds a newline the secret then contains:
+
+```
+printf '%s' "$password" | task tf:secrets:push:ask STACK=app VARS=dev VAR=db_password
+```
+
+Values only ever travel through files and stdin, never as arguments, so
+they stay out of `ps`, shell history and the task output. The tasks that
+handle them run under `umask 077`: the secret tfvars, the file secrets, the
+directories created for them and every scratch file are owner-only from the
+moment they exist, and the scratch files are removed however the task ends.
+`FILE` is relative to the directory you run `task` in.
+
+### What a value looks like in the tfvars
+
+Secret variables are strings, so an inline value is always written as one.
+
+- A payload with no newline is a quoted string with `\`, `"`, `${` and `%{`
+  escaped (`${` and `%{` become `$${` and `%%{`, so a value is never
+  interpolated).
+- A payload with a newline is a heredoc (`<<EOT`, or `EOT1`, `EOT2`... if
+  the payload has a line that is itself `EOT`), with `${` and `%{` escaped.
+  HCL keeps a heredoc's final newline, so a config that cares writes
+  `chomp(var.x)`.
+- A zero-length payload is an error: Secret Manager accepts it and
+  Terraform would see `""`, which is nearly always a mistake.
+
+Secret Manager caps a payload at 64 KiB. Inline secrets are stored as they
+are and must fit. **File secrets are gzipped** (`gzip -n`, so the same file
+is the same bytes and an unchanged file does not add a version) and must fit
+after compression. On pull the first two bytes decide: `1f 8b` is
+gunzipped, anything else is written as it is, so a file uploaded by other
+tools uncompressed still works. A new secret is labelled `stack`, `vars`,
+`var` (and `encoding=gzip` for files) for whoever audits the project;
+nothing reads the labels.
+
+`dev.secret.tfvars` starts with a header, which `tf:secrets` reads to tell
+whether you are behind:
+
+```
+# written by: task tf:secrets:pull:ask STACK=app VARS=dev
+# do not edit, do not commit. Regenerate with the same command.
+# db_password = app-dev-db_password@3
+```
+
+### Settings
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SECRETS_PROJECT` | `BOOTSTRAP_PROJECT` | Project holding the secrets. Set it when `BOOTSTRAP_PROJECT` is empty or is not where the secrets belong: the tasks do not check it |
+| `SECRET_PREFIX` | empty | Prepended to every convention id |
+| `SECRETS_DIR` | `secrets` | The repo's one home of file secrets, relative to the repo root; files go in `<SECRETS_DIR>/<stack>/<vars_id>/` |
+| `SECRETS_FILE` | `variables/<vars_id>.secrets.hcl` | The manifest, stack-relative |
+| `SECRET_TFVARS` | `variables/<vars_id>.secret.tfvars` | What pull writes, stack-relative |
+| `SECRETS_TF` | `secrets.tf` | Where `tf:secrets:new:ask` declares variables, stack-relative |
+
 ## Command reference
 
 `STACK`, `VARS`, `BACKEND` and `TF` apply to every `tf:*` task and are
@@ -407,6 +686,18 @@ passes `-backend-config=<file>` through.
 `task test` runs `tf:fmt:check:all` and `tf:validate:all` — the offline
 check set.
 
+### `tf:secrets:*` — secrets
+
+Secret Manager, one secret per sensitive variable. The tasks, the manifest
+and the layout are described under [Secrets](#secrets).
+
+| Task | What it does |
+| --- | --- |
+| `tf:secrets:setup` / `:new` | One-time setup; create a secret (`ID=<var> [FILE=<path>]`) and declare its variable |
+| `tf:secrets` | What the stack needs, and each secret's state in the cloud and here |
+| `tf:secrets:pull:ask` / `:push:ask` | Fetch every secret into `<vars_id>.secret.tfvars` and the file secrets; store one (`VAR=<var> [FILE=<path>]`) |
+| `tf:secrets:assert` | Offline: fail unless every required secret is on this machine |
+
 ### `tf:plan:*` — plan
 
 | Task | What it does |
@@ -417,10 +708,12 @@ check set.
 | `tf:plan:debug` | Plan with full provider HTTP logging to `<TMP>/<stack>-debug-<tf>.log` |
 
 The plan filename carries all four keys, so distinct combinations never
-share one. Applying a saved plan takes no `-var-file`, which makes the
-plan the only record of which values went into it — with one filename
-per stack, planning prod after dev would leave `tf:apply:ask` holding
-prod's plan under a dev invocation, with nothing to notice.
+share one. With one filename per stack, planning prod after dev would
+leave `tf:apply:ask` holding prod's plan under a dev invocation, with
+nothing to notice. `tf:apply:ask` does pass the var files again (a saved
+plan holds no ephemeral value, so tofu needs those again), but tofu
+refuses a non-ephemeral value that differs from the one in the plan, so
+the plan stays the record of what was planned.
 
 `tf:plan:debug` writes OAuth bearer tokens and full API payloads to that
 log. It stays in the gitignored temp dir; redact before attaching it to
@@ -434,7 +727,7 @@ resolve. `tf:output` and `tf:clean` are ungated.
 
 | Task | What it does |
 | --- | --- |
-| `tf:apply:ask` | Apply the **saved plan file**, not a fresh plan |
+| `tf:apply:ask` | Apply the **saved plan file**, not a fresh plan, with the plan's var files (ephemeral values are not saved in it) |
 | `tf:refresh:ask` | `apply -refresh-only` — reconcile state with reality, change nothing |
 | `tf:force-unlock:ask` | `force-unlock -force <var-files> ID=<lock id>` — drop a stale state lock on the chosen `BACKEND` |
 | `tf:destroy:deny` | `destroy` everything the stack manages |
@@ -443,27 +736,38 @@ resolve. `tf:output` and `tf:clean` are ungated.
 
 ## The guards
 
-Four internal tasks refuse a run before tofu starts. Worth knowing by
+Five tasks refuse a run before tofu starts. Worth knowing by
 name, because their messages are what you see when something is
 misconfigured — and each prints the names that *do* exist, so the
 recovery is in the error.
 
 | Guard | Refuses when | Because |
 | --- | --- | --- |
-| `tf:vars:assert` | `VARS` names nothing in `VARS_MAP`, or a glob matches no file | tofu treats a missing `-var-file` as fine and plans from variable defaults |
+| `tf:vars:assert` | `VARS` names nothing in `VARS_MAP`, or a glob matches no file (`*.secret.tfvars` entries excepted: `tf:secrets:assert` owns those) | tofu treats a missing `-var-file` as fine and plans from variable defaults |
 | `tf:backend:assert` | `BACKEND` resolves to no backend config that exists — no `backend.hcl`, no `.tf` with an inline backend block | otherwise tofu says `bucket must be set` — true, and silent about what was missing |
 | `tf:stack:assert` | a writing task targets a stack with no backend config of either form | its state is local and empty; an apply would create a second copy of resources another stack owns |
 | `tf:toolchain:assert:tofu`\* | a writing task runs under `TF=terraform` | both toolchains share one remote state |
+| `tf:secrets:assert` | a required secret is not on this machine: an inline one with no line in `<vars_id>.secret.tfvars`, a file one whose file does not exist | tofu would prompt for the variable, or plan with a missing credential file |
 
 \* named `tf:toolchain:assert:terraform` in a terraform-only repo — the
 purpose is "one toolchain writes", named after whichever one that is.
+
+`tf:secrets:assert` runs right after `tf:vars:assert` in every task whose
+tofu command evaluates the variables: `tf:plan`, `tf:plan:debug`,
+`tf:apply:ask`, `tf:refresh:ask` and `tf:destroy:deny`. It reads the
+variables and the manifest and nothing else, so it needs neither network
+nor `gcloud`. It stays out of `tf:force-unlock:ask`, which only touches the
+lock: a missing secret must not block an emergency unlock.
 
 ## Local state
 
 Everything tf-stack writes locally is gitignored: the configured `TMP`
 dir (plan files, the debug log, stashed locks, plugin cache),
 `.terraform-*/` (per-toolchain, per-backend working directories),
-`<stack>.env` (written by `tf:use`), and `.terraform.lock.hcl`. `task
-tf:clean` removes all of it for a stack except `<stack>.env`, which
-`tf:use:clear` drops; `task tmp:setup` recreates the temp dir and is
-already a dependency of every task that needs it.
+`<stack>.env` (written by `tf:use`), `.terraform.lock.hcl`, and the
+secrets (`variables/*.secret.tfvars` and the repo's `secrets/` directory). `task
+tf:clean` removes the temp dir, the data directories and the lock file, and
+leaves `<stack>.env`, which `tf:use:clear` drops, and the secrets: pulling
+them again costs a round trip, and a file secret may be the only copy you
+have been editing. Delete them by hand. `task tmp:setup` recreates the temp
+dir and is already a dependency of every task that needs it.

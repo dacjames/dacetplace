@@ -22,39 +22,71 @@ _normalize_spec() {
 # outside a /* */ block comment, multi-line ones included and mid-line ones cut
 # out, and not on a line that starts with # or //. A trailing # or // comment
 # after code is left where it is: every reader below matches from the start of
-# the line and stops before it. Tabs count as indentation. Those readers work
-# on this output rather than on raw lines, so comment handling is written once.
-# The file may be `-`, which awk reads as stdin -- that is what lets a block
-# extracted by _hcl_block be fed straight back in.
+# the line and stops before it. Comment markers inside a quoted string are
+# text, so "stacks/*/x" opens no comment. The body of a heredoc (<<EOT or
+# <<-EOT through the line that is only EOT) comes out as blank lines, so prose
+# in a description can neither set an attribute nor unbalance a brace count.
+# Tabs count as indentation. Those readers work on this output rather than on
+# raw lines, so this is written once. The file may be `-`, which awk reads as
+# stdin -- that is what lets a block extracted by _hcl_block be fed straight
+# back in.
 _hcl_lines() {
   local file="$1"
 
   awk '
+    hd != "" {
+      t = $0
+      sub(/^[ \t]+/, "", t)
+      sub(/[ \t]+$/, "", t)
+      if (t == hd) hd = ""
+      print ""
+      next
+    }
     {
       line = $0
-      while (1) {
+      if (inblock && index(line, "*/") == 0) next
+      out = ""; code = ""; instr = 0; n = length(line); i = 1; tail = 0
+      while (i <= n) {
         if (inblock) {
-          i = index(line, "*/")
-          if (i == 0) next
-          line = substr(line, i + 2)
+          j = index(substr(line, i), "*/")
+          if (j == 0) break
+          i += j + 1
           inblock = 0
+          continue
         }
-        i = index(line, "/*")
-        if (i == 0) break
-        rest = substr(line, i + 2)
-        j = index(rest, "*/")
-        if (j == 0) { line = substr(line, 1, i - 1); inblock = 1; break }
-        line = substr(line, 1, i - 1) substr(rest, j + 2)
+        c = substr(line, i, 1)
+        if (instr) {
+          if (c == "\\") { out = out substr(line, i, 2); i += 2; continue }
+          if (c == "\"") instr = 0
+          out = out c
+          i++
+          continue
+        }
+        two = substr(line, i, 2)
+        if (two == "/*") { inblock = 1; i += 2; continue }
+        if (c == "#" || two == "//") { code = out; out = out substr(line, i); tail = 1; break }
+        if (c == "\"") instr = 1
+        out = out c
+        i++
       }
-      sub(/^[ \t]+/, "", line)
-      if (line ~ /^(#|\/\/)/) next
-      print line
+      if (!tail) code = out
+      if (!instr && match(code, /<<-?[A-Za-z_][A-Za-z0-9_]*[ \t]*$/)) {
+        hd = substr(code, RSTART, RLENGTH)
+        sub(/^<<-?/, "", hd)
+        sub(/[ \t]+$/, "", hd)
+      }
+      sub(/^[ \t]+/, "", out)
+      if (out ~ /^(#|\/\/)/) next
+      print out
     }' "$file"
 }
 
 # The string value of `<key> = "..."` in an HCL file: the first live one, value
 # only. Enough HCL for a backend config; not an HCL parser. Prints nothing when
-# the key is absent. The first match wins but the whole input is still read:
+# the key is absent. It matches at any block depth, so a nested block with a
+# clashing key (a `validation {}` inside a `variable`, say) can answer for the
+# outer one: a known limit, fine for the flat blocks this is pointed at. The
+# first match wins but the whole input is still read:
 # quitting early would SIGPIPE the _hcl_lines feeding it, which `pipefail`
 # would then report as a failure of this function.
 _hcl_string() {
@@ -95,6 +127,29 @@ _hcl_block() {
     }'
 }
 
+# Every `<kind> "<label>" {` block of an HCL file, not only the first: each one
+# from its header line through its closing brace, as live lines, one after the
+# other. A consumer starts a new record at each header line. Depth is counted
+# over every line, so a block of the same kind nested inside another block is
+# not mistaken for a top-level one, and braces are counted the way _hcl_block
+# counts them: after quoted strings are deleted (heredoc bodies are already
+# blank). Takes `-` for stdin, like _hcl_lines.
+_hcl_blocks() {
+  local kind="$1" file="$2"
+
+  _hcl_lines "$file" | awk -v kind="$kind" '
+    {
+      t = $0
+      gsub(/"[^"]*"/, "", t)
+      opens = gsub(/[{]/, "&", t)
+      closes = gsub(/[}]/, "&", t)
+      if (!inblock && depth == 0 && $0 ~ "^" kind "[ \t]*\"[^\"]*\"[ \t]*[{]") inblock = 1
+      if (inblock) print
+      depth += opens - closes
+      if (depth <= 0) { depth = 0; inblock = 0 }
+    }'
+}
+
 # VARS_RESOLVED / BACKEND_RESOLVED: expand a bare id (VARS=dev) through its
 # map to the spelled-out <id>:<glob,...> or <id>:<path>. A value that already
 # has a ':' passes through (normalized) -- only the bare-id form needs a
@@ -128,20 +183,33 @@ USE_VARS() {
 
 # The -var-file=... flags for a resolved VARS. Runs from STACK_DIR because the
 # globs are stack-relative; a glob matching nothing is silently dropped here
-# (vars:assert-vars is what catches a typo, not this).
+# (vars:assert-vars is what catches a typo, not this). The optional third
+# argument is the stack-relative secret tfvars, appended last, so it wins, when
+# the file exists. It is named rather than globbed because a VARS_MAP entry
+# need not cover it: prod's glob list is variables/prod.tfvars and would miss it.
+# For the same reason a glob never loads one: dev's variables/dev*.tfvars would
+# match dev.secret.tfvars in the middle of the list, and a broader glob would
+# load another vars_id's secrets.
 VAR_FILES() {
   local STACK_DIR="$1"
   local VARS_RESOLVED="$2"
+  local SECRET_TFVARS="${3:-}"
 
   cd "$STACK_DIR" 2>/dev/null || exit 0
   local globs
   globs=$(printf '%s' "$VARS_RESOLVED" | cut -d: -f2-)
   IFS=','
   for f in $globs; do
+    case "$f" in
+      *.secret.tfvars|"$SECRET_TFVARS") continue ;;
+    esac
     if [ -e "$f" ]; then
       printf '%s ' "-var-file=$f"
     fi
   done
+  if [ -n "$SECRET_TFVARS" ] && [ -f "$SECRET_TFVARS" ]; then
+    printf '%s ' "-var-file=$SECRET_TFVARS"
+  fi
   exit 0
 }
 
@@ -166,11 +234,13 @@ VARS_IDS_PRESENT() {
     globs=$(printf '%s' "$resolved" | cut -d: -f2-)
     [ -n "$globs" ] || continue
     # In a subshell: the cd is stack-relative like the globs are, and a glob
-    # that matches nothing exits non-zero, disqualifying the whole id.
+    # that matches nothing exits non-zero, disqualifying the whole id. A
+    # *.secret.tfvars entry is skipped, as tf_vars_assert skips it.
     (
       cd "$STACK_DIR" 2>/dev/null || exit 1
       IFS=','
       for g in $globs; do
+        case "$g" in *.secret.tfvars) continue ;; esac
         set -- $g
         [ -e "$1" ] || exit 1
       done
@@ -492,7 +562,10 @@ tf_backend_assert() {
 }
 
 # tf:vars:assert -- refuse to proceed if VARS doesn't resolve to real tfvars
-# files, with a message that says why.
+# files, with a message that says why. A *.secret.tfvars entry is not checked:
+# VAR_FILES never loads one through VARS, and tf:secrets:assert owns the
+# current one, which a clean clone does not have until tf:secrets:pull:ask
+# writes it -- requiring it here would block the pull that creates it.
 tf_vars_assert() {
   fail() {
     echo "$1" >&2
@@ -519,6 +592,14 @@ tf_vars_assert() {
   [ -n "$globs" ] || fail "VARS=$vars selects no files."
   IFS=','
   for g in $globs; do
+    case "$g" in
+      *.secret.tfvars)
+        if [ "$g" != "$V_SECRET_TFVARS" ]; then
+          echo "note: VARS entry '$g' is never loaded. Secret values come from $V_SECRET_TFVARS," >&2
+          echo "      written by task tf:secrets:pull:ask; see Secrets in docs/tf-stack.md." >&2
+        fi
+        continue ;;
+    esac
     set -- $g
     [ -e "$1" ] || fail "VARS glob '$g' matched no files in $V_STACK_DIR."
   done
@@ -697,9 +778,14 @@ tf_vars() {
   printf '%-10s %s\n' VARS_ID "$V_VARS_ID"
   printf '%-10s %s\n' BACKEND "$V_BACKEND_ID"
   printf '%-10s %s\n' PLAN "$V_PLAN_FILE"
+  if [ -f "$V_STACK_DIR/$V_SECRETS_FILE" ]; then
+    printf '%-10s %s (present)\n' SECRETS "$V_SECRETS_FILE"
+  else
+    printf '%-10s %s (absent)\n' SECRETS "$V_SECRETS_FILE"
+  fi
   printf '%-10s\n' FILES
   local f
-  for f in $(VAR_FILES "$V_STACK_DIR" "$V_VARS_RESOLVED"); do
+  for f in $(VAR_FILES "$V_STACK_DIR" "$V_VARS_RESOLVED" "$V_SECRET_TFVARS"); do
     echo "  ${f#-var-file=}"
   done
 }
@@ -759,6 +845,962 @@ tf_use_clear() {
   fi
 }
 
+# tf:secrets:* -- Secret Manager secrets for a stack, one secret per variable.
+#
+# A variable with `sensitive = true` or `ephemeral = true` IS a secret; nothing
+# else declares one. The optional variables/<vars_id>.secrets.hcl only says where
+# a secret lands (`file`) or which Secret Manager id backs it (`id`) and is
+# written by hand, never by a task. A secret is `inline` (its value becomes
+# `<var> = "..."` in the stack's gitignored secret tfvars) or `file` (its payload
+# is written to a path and the variable's value is that path). SECRETS_DISCOVER
+# computes the rows offline; every task below consumes them. Values only ever
+# travel through files and stdin, never argv and never echo, and every task that
+# handles one runs under umask 077 with its scratch files in a private dir that
+# is removed however the script exits.
+
+TAB=$'\t'
+
+# Secret Manager caps a payload at 64 KiB.
+SECRETS_MAX_BYTES=65536
+
+# The awk shared by the two block readers below. It splits _hcl_blocks output
+# into records and calls the reader's own begin_block(label), attr(text) and
+# end_block(); attr sees only the lines at depth 1 of the block, so a nested
+# `validation {}` or a multi-line `default` cannot answer for the block itself.
+# Needs -v kind=<block kind>.
+_SECRETS_BLOCK_AWK='
+  $0 ~ "^" kind "[ \t]*\"" {
+    if (open) end_block()
+    open = 1
+    label = $0
+    sub(/^[^"]*"/, "", label)
+    sub(/".*/, "", label)
+    begin_block(label)
+    rest = $0
+    sub(/^[^{]*[{][ \t]*/, "", rest)
+    t = rest
+    gsub(/"[^"]*"/, "", t)
+    depth = 1 + gsub(/[{]/, "&", t) - gsub(/[}]/, "&", t)
+    if (depth <= 0) sub(/[ \t]*[}][ \t]*$/, "", rest)
+    if (rest != "") attr(rest)
+    next
+  }
+  open {
+    if (depth == 1) attr($0)
+    t = $0
+    gsub(/"[^"]*"/, "", t)
+    depth += gsub(/[{]/, "&", t) - gsub(/[}]/, "&", t)
+  }
+  END { if (open) end_block() }'
+
+# One `V<TAB>name<TAB>secret<TAB>default<TAB>type` row per `variable` block in
+# the stack's *.tf files (not subdirectories: those are modules). secret is 1
+# when the block sets `sensitive = true` or `ephemeral = true`, else 0. default
+# is none (no default), null (`default = null`) or value (anything else). type
+# is the text after `type =`, empty when the variable has none.
+_secrets_variables() {
+  local dir="$1" f
+  for f in "$dir"/*.tf; do
+    [ -f "$f" ] || continue
+    _hcl_blocks variable "$f" | awk -v kind=variable '
+      BEGIN { OFS = "\t" }
+      function begin_block(l) { name = l; secret = 0; def = "none"; type = "" }
+      function value(s, key,   v) {
+        v = s
+        sub("^" key "[ \t]*=[ \t]*", "", v)
+        sub(/[ \t]*(#|\/\/).*$/, "", v)
+        sub(/[ \t]+$/, "", v)
+        return v
+      }
+      function attr(s) {
+        if (s ~ /^(sensitive|ephemeral)[ \t]*=[ \t]*true([^A-Za-z0-9_]|$)/) secret = 1
+        else if (s ~ /^default[ \t]*=/) def = (value(s, "default") == "null") ? "null" : "value"
+        else if (s ~ /^type[ \t]*=/) type = value(s, "type")
+      }
+      function end_block() { print "V", name, secret, def, type }
+      '"$_SECRETS_BLOCK_AWK"
+  done
+  return 0
+}
+
+# One `M<TAB>label<TAB>file<TAB>id<TAB>errors` row per `secret` block of a
+# manifest. errors is empty unless the block holds an attribute other than a
+# quoted `file` or `id`.
+_secrets_manifest() {
+  local file="$1"
+
+  _hcl_blocks secret "$file" | awk -v kind=secret '
+    BEGIN { OFS = "\t" }
+    function err(m) { errs = errs sep m; sep = "; " }
+    function begin_block(l) { name = l; file = ""; id = ""; errs = ""; sep = "" }
+    function attr(s,   key, rest, v) {
+      if (s == "" || s ~ /^[}]/) return
+      if (!match(s, /^[A-Za-z_][A-Za-z0-9_-]*/)) { err("cannot read the line \"" s "\""); return }
+      key = substr(s, 1, RLENGTH)
+      rest = substr(s, RLENGTH + 1)
+      if (rest !~ /^[ \t]*=/) { err("cannot read the line \"" s "\""); return }
+      sub(/^[ \t]*=[ \t]*/, "", rest)
+      if (key != "file" && key != "id") { err("unknown attribute \"" key "\" (only file and id are allowed)"); return }
+      if (!match(rest, /^"[^"]*"/)) { err(key " must be a quoted string"); return }
+      v = substr(rest, 2, RLENGTH - 2)
+      if (v == "") { err(key " is empty"); return }
+      if (key == "file") file = v
+      else id = v
+    }
+    function end_block() { print "M", name, file, id, errs }
+    '"$_SECRETS_BLOCK_AWK"
+}
+
+# SECRETS_DIR, checked and tidied: relative to the repo root, a directory below
+# it. Prints the path without a leading ./, doubled or trailing slashes; prints
+# what it must be and returns 1 for an empty value, an absolute path, or one
+# with a .. segment (or one that is the root itself).
+_secrets_dir_clean() {
+  local d="$1" clean=""
+  case "$d" in
+    ''|/*) ;;
+    *) case "/$d/" in
+         */../*) ;;
+         *) clean=$(_secrets_norm "$d") ;;
+       esac ;;
+  esac
+  if [ -z "$clean" ] || [ "$clean" = . ]; then
+    echo "SECRETS_DIR='$d' is not valid: it must be a directory below the repo root, written relative to it (default: secrets) -- not empty, not absolute, with no .. segment." >&2
+    return 1
+  fi
+  printf '%s\n' "$clean"
+}
+
+# SECRETS_DISCOVER <stack_dir> <vars_id> <manifest> <prefix> <stack> <secrets_dir>
+# One tab-separated row per secret, sorted by variable:
+#
+#   var  kind  required  id  dest  tfvar
+#
+# kind is inline or file. required is yes for a variable with no default and for
+# every file-only secret, no for one with `default = null`; any other default is
+# an error, since it would put a value in git. id is the manifest's `id`, else
+# <prefix><stack>-<vars_id>-<var>. dest is `-` for inline, else the payload's
+# path relative to the stack, which is also the value a pull writes for a file
+# variable, since tofu runs in the stack dir. A bare manifest `file` lives in
+# <secrets_dir>/<stack>/<vars_id>/ -- secrets_dir is relative to the repo root,
+# so dest climbs out of the stack dir to reach it (stacks/app, SECRETS_DIR
+# secrets: ../../secrets/app/dev/sa.json). A file starting ./ ../ or / is taken
+# as written. tfvar is no only for a file-only secret, a manifest block whose
+# label is not a variable, which gets no line in the secret tfvars. manifest is
+# stack-relative and may be absent.
+# Offline. Every problem is reported on stderr and the exit status is 1, with no
+# rows on stdout.
+SECRETS_DISCOVER() {
+  local stack_dir="$1" vars_id="$2" manifest="$3" prefix="$4" stack="$5" secrets_dir="$6"
+  local sdir
+
+  sdir=$(_secrets_dir_clean "$secrets_dir") || return 1
+
+  [ -d "$stack_dir" ] || {
+    echo "secrets: no stack directory $stack_dir" >&2
+    return 1
+  }
+
+  {
+    _secrets_variables "$stack_dir"
+    if [ -f "$stack_dir/$manifest" ]; then
+      _secrets_manifest "$stack_dir/$manifest"
+    fi
+  } | awk -F'\t' -v mpath="$stack_dir/$manifest" -v stack_dir="$stack_dir" \
+        -v vars_id="$vars_id" -v prefix="$prefix" -v stack="$stack" -v sdir="$sdir" '
+    function fail(m) { errs++; print "secrets: " m > "/dev/stderr" }
+    function add(var, kind, req, id, dest, tfvar) {
+      if (id !~ /^[A-Za-z0-9_-]+$/ || length(id) > 255)
+        fail("the Secret Manager id \"" id "\" for " var " is not valid (letters, digits, _ and - only, at most 255 characters). Set id = \"<valid id>\" for it in " mpath ".")
+      if (dest != "-" && (dest in seen))
+        fail(var " and " seen[dest] " both write " dest ". Give one of them another file.")
+      seen[dest] = var
+      rows[++nr] = var "\t" kind "\t" req "\t" id "\t" dest "\t" tfvar
+    }
+    $1 == "V" { nv++; vn[nv] = $2; vs[nv] = $3; vd[nv] = $4; vt[nv] = $5; vi[$2] = nv; next }
+    $1 == "M" {
+      nm++; ml[nm] = $2; mf[nm] = $3; mi[nm] = $4; me[nm] = $5
+      if ($2 in mx) fail(mpath ": secret \"" $2 "\" is declared twice.")
+      mx[$2] = nm
+      next
+    }
+    END {
+      # The way back up from the stack dir to the repo root, ../ per segment
+      # (stacks/app gives ../../), so a path under SECRETS_DIR can be written
+      # as tofu, which runs in the stack dir, resolves it. Lexical: macOS has no
+      # realpath --relative-to.
+      ups = ""
+      nseg = split(stack_dir, seg, "/")
+      if (stack_dir ~ /^\//) fail("the stack directory " stack_dir " must be relative to the repo root.")
+      for (i = 1; i <= nseg; i++) {
+        if (seg[i] == "" || seg[i] == ".") continue
+        if (seg[i] == "..") fail("the stack directory " stack_dir " must be relative to the repo root, with no .. segment.")
+        else ups = ups "../"
+      }
+      for (i = 1; i <= nv; i++) {
+        if (!vs[i]) continue
+        n = vn[i]
+        if (vt[i] != "" && vt[i] != "string")
+          fail("variable \"" n "\" is a secret (sensitive or ephemeral) but has type = " vt[i] ". A secret is a string: store JSON in a string variable and jsondecode(var." n ") in the configuration.")
+        if (vd[i] == "value")
+          fail("variable \"" n "\" is a secret (sensitive or ephemeral) but has a default value, which would put that value in git. Remove the default to make it required, or write default = null to make it optional.")
+        f = ""; id = ""
+        if (n in mx) { f = mf[mx[n]]; id = mi[mx[n]] }
+        if (id == "") id = prefix stack "-" vars_id "-" n
+        req = (vd[i] == "none") ? "yes" : "no"
+        if (f == "") add(n, "inline", req, id, "-", "yes")
+        else add(n, "file", req, id, (f ~ /^(\.\/|\.\.\/|\/)/) ? f : ups sdir "/" stack "/" vars_id "/" f, "yes")
+      }
+      for (j = 1; j <= nm; j++) {
+        l = ml[j]
+        if (me[j] != "") fail(mpath ": secret \"" l "\": " me[j] ".")
+        if (l !~ /^[A-Za-z_][A-Za-z0-9_-]*$/) fail(mpath ": \"" l "\" is not a valid name.")
+        if (l in vi) {
+          if (!vs[vi[l]]) fail(mpath ": \"" l "\" is a variable but neither sensitive nor ephemeral. Set sensitive = true on variable \"" l "\" to make it a secret.")
+        } else if (mf[j] == "") {
+          fail(mpath ": \"" l "\" is not a variable in " stack_dir " and has no file. A secret that is not a variable is a file some other tool reads: add file = \"<path>\".")
+        } else {
+          id = mi[j]
+          if (id == "") id = prefix stack "-" vars_id "-" l
+          add(l, "file", "yes", id, (mf[j] ~ /^(\.\/|\.\.\/|\/)/) ? mf[j] : ups sdir "/" stack "/" vars_id "/" mf[j], "no")
+        }
+      }
+      if (errs) exit 1
+      for (r = 1; r <= nr; r++) print rows[r]
+    }' | LC_ALL=C sort
+}
+
+# The rows for the current task's STACK and VARS, from the V_* environment.
+_secrets_rows() {
+  SECRETS_DISCOVER "$V_STACK_DIR" "$V_VARS_ID" "$V_SECRETS_FILE" "$V_SECRET_PREFIX" "$V_STACK" "$V_SECRETS_DIR"
+}
+
+# The gcloud check tf_setup makes.
+_secrets_need_gcloud() {
+  command -v gcloud >/dev/null 2>&1 || {
+    echo "gcloud not found. Install the Google Cloud CLI and run 'gcloud auth login'." >&2
+    exit 1
+  }
+}
+
+# A private scratch dir under $V_TMP for payloads and staged files, removed when
+# the script exits however it exits (an EXIT trap: bash runs it on INT, TERM and
+# HUP too). _SECRETS_WORK names it. From here on the umask is 077, so every file
+# and directory the task creates -- scratch, secret tfvars, file secrets and
+# their parent dirs -- is owner-only from the moment it exists; _SECRETS_UMASK
+# keeps the caller's for the files that are not secret (.gitignore, secrets.tf).
+_secrets_work_init() {
+  _SECRETS_UMASK=$(umask)
+  umask 077
+  mkdir -p "$V_TMP"
+  _SECRETS_WORK=$(mktemp -d "$V_TMP/secrets.XXXXXX")
+  trap 'rm -rf "$_SECRETS_WORK"' EXIT
+}
+
+# Whether a gcloud failure, whose stderr is in $1, means the secret or version
+# does not exist, as against something worth stopping for (auth, permissions).
+_secrets_not_found() {
+  grep -qE 'NOT_FOUND|not found' "$1"
+}
+
+# The latest version number of a secret, in _SECRETS_VERSION. Returns 3 when the
+# secret or any version of it is missing, 1 (stderr shown) on any other failure.
+_secrets_latest() {
+  local id="$1" err="$_SECRETS_WORK/gcloud.err" name
+  if name=$(gcloud secrets versions describe latest --secret="$id" --project="$V_SECRETS_PROJECT" \
+              --format='value(name)' 2>"$err" </dev/null); then
+    _SECRETS_VERSION="${name##*/}"
+    return 0
+  fi
+  _secrets_not_found "$err" && return 3
+  cat "$err" >&2
+  return 1
+}
+
+# Whether a secret exists: 0 yes, 3 no, 1 on any other failure.
+_secrets_exists() {
+  local id="$1" err="$_SECRETS_WORK/gcloud.err"
+  if gcloud secrets describe "$id" --project="$V_SECRETS_PROJECT" --format='value(name)' \
+       >/dev/null 2>"$err" </dev/null; then
+    return 0
+  fi
+  _secrets_not_found "$err" && return 3
+  cat "$err" >&2
+  return 1
+}
+
+# Fetch a secret's latest payload, raw, into the file $2; its version lands in
+# _SECRETS_VERSION. Same return codes as _secrets_latest. The version is read
+# first and the payload fetched by number, so the two always belong together.
+_secrets_fetch() {
+  local id="$1" out="$2" err="$_SECRETS_WORK/gcloud.err" rc=0
+  _secrets_latest "$id" || rc=$?
+  [ "$rc" = 0 ] || return "$rc"
+  if gcloud secrets versions access "$_SECRETS_VERSION" --secret="$id" --project="$V_SECRETS_PROJECT" \
+       >"$out" 2>"$err" </dev/null; then
+    return 0
+  fi
+  _secrets_not_found "$err" && return 3
+  cat "$err" >&2
+  return 1
+}
+
+# Add one line to .gitignore unless it is already there, as tf_use does for *.env.
+# A missing .gitignore is created with the caller's umask: it is committed.
+_secrets_gitignore_line() {
+  local line="$1"
+  [ -f .gitignore ] || ( umask "${_SECRETS_UMASK:-$(umask)}"; : > .gitignore )
+  grep -qxF "$line" .gitignore && return 0
+  # A file that does not end in a newline would swallow the line.
+  [ -z "$(tail -c 1 .gitignore)" ] || echo >> .gitignore
+  echo "$line" >> .gitignore
+  echo ".gitignore: added $line"
+}
+
+# What pull and setup keep out of git: the secret tfvars, and the secrets dir.
+# The dir is anchored to the repo root so it cannot match a module directory that
+# happens to be called secrets/ somewhere else.
+_secrets_gitignore() {
+  local dir
+  dir=$(_secrets_dir_clean "$V_SECRETS_DIR") || exit 1
+  _secrets_gitignore_line '*.secret.tfvars'
+  _secrets_gitignore_line "/$dir/"
+}
+
+# A path with . and .. segments and doubled slashes resolved, lexically. Used so
+# the path git is asked about, and the .gitignore line suggested, read cleanly.
+_secrets_norm() {
+  printf '%s\n' "$1" | awk -F/ '
+    {
+      abs = ($0 ~ /^\//)
+      n = 0
+      for (i = 1; i <= NF; i++) {
+        p = $i
+        if (p == "" || p == ".") continue
+        if (p == "..") {
+          if (n > 0 && st[n] != "..") n--
+          else if (!abs) st[++n] = ".."
+          continue
+        }
+        st[++n] = p
+      }
+      out = abs ? "/" : ""
+      for (i = 1; i <= n; i++) out = out (i > 1 ? "/" : "") st[i]
+      if (out == "") out = "."
+      print out
+    }'
+}
+
+# Where a row's dest really is, from the repo root.
+_secrets_dest_path() {
+  case "$1" in
+    /*) _secrets_norm "$1" ;;
+    *)  _secrets_norm "$V_STACK_DIR/$1" ;;
+  esac
+}
+
+# Prints a refusal and returns 1 unless git ignores the path. In-situ file
+# destinations are the reason this exists: nothing else stops a pull from writing
+# a credential somewhere a `git add .` would pick it up.
+_secrets_check_ignored() {
+  local path="$1" rc=0
+  git check-ignore -q -- "$path" 2>/dev/null || rc=$?
+  [ "$rc" != 0 ] || return 0
+  echo "refusing to write $path: git does not ignore it. Add this line to .gitignore:" >&2
+  case "$path" in
+    /*|../*|..) echo "  $path   (it is outside this repository, so git cannot ignore it: choose another file)" >&2 ;;
+    *)          echo "  /$path" >&2 ;;
+  esac
+  return 1
+}
+
+# Whether a row's secret is on this machine: an inline row has a `<var> =` line in
+# the secret tfvars, a file row has its file (and, when it is a variable, the line).
+_secrets_local_present() {
+  local var="$1" kind="$2" dest="$3" tfvar="$4" tfvars="$V_STACK_DIR/$V_SECRET_TFVARS"
+  if [ "$kind" = file ] && [ ! -f "$(_secrets_dest_path "$dest")" ]; then
+    return 1
+  fi
+  [ "$tfvar" = no ] && return 0
+  [ -f "$tfvars" ] && grep -Eq "^$var[[:space:]]*=" "$tfvars"
+}
+
+# The version recorded for a secret id in the secret tfvars' header, if any.
+_secrets_local_version() {
+  local tfvars="$1" id="$2"
+  [ -f "$tfvars" ] || return 0
+  awk -v id="$id" '
+    /^#/ {
+      v = $0
+      sub(/^#[ \t]*[^ \t]+[ \t]*=[ \t]*/, "", v)
+      n = index(v, "@")
+      if (n > 0 && substr(v, 1, n - 1) == id) { print substr(v, n + 1); exit }
+    }' "$tfvars"
+}
+
+# The HCL assignment for an inline payload, on stdout. A payload with no newline
+# is one quoted string, with \ " ${ and %{ escaped. One with a newline is a
+# heredoc, whose delimiter is the first of EOT, EOT1, EOT2 ... that is not a line
+# of the payload; only ${ and %{ are escaped there, since a heredoc takes
+# backslashes and quotes as they are. HCL keeps the heredoc's final newline, so a
+# payload that lacks one gains it: configs that care use chomp().
+_secrets_encode_inline() {
+  local var="$1" file="$2" mode=single
+  [ "$(wc -l < "$file" | tr -d ' ')" = 0 ] || mode=heredoc
+  LC_ALL=C awk -v var="$var" -v mode="$mode" '
+    function esc(s, quoted,   out, i, n, c, d) {
+      if (s !~ /[\\"$%]/) return s
+      out = ""
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        d = substr(s, i + 1, 1)
+        if (quoted && c == "\\") out = out "\\\\"
+        else if (quoted && c == "\"") out = out "\\\""
+        else if ((c == "$" || c == "%") && d == "{") out = out c c
+        else out = out c
+      }
+      return out
+    }
+    { line[NR] = $0 }
+    END {
+      if (mode == "single") {
+        print var " = \"" esc(line[1], 1) "\""
+        exit
+      }
+      for (k = 0; ; k++) {
+        delim = (k == 0) ? "EOT" : "EOT" k
+        clash = 0
+        for (i = 1; i <= NR; i++) {
+          t = line[i]
+          sub(/^[ \t]+/, "", t)
+          sub(/[ \t]+$/, "", t)
+          if (t == delim) { clash = 1; break }
+        }
+        if (!clash) break
+      }
+      print var " = <<" delim
+      for (i = 1; i <= NR; i++) print esc(line[i], 0)
+      print delim
+    }' "$file"
+}
+
+# Copy FILE=<path> to $2. A relative path is taken from the directory task was
+# run in (V_USER_WORKING_DIR), not the repo root that go-task runs commands from.
+_secrets_read_file() {
+  local file="$1" out="$2"
+  case "$file" in
+    /*) ;;
+    *) file="${V_USER_WORKING_DIR:-.}/$file" ;;
+  esac
+  [ -f "$file" ] || {
+    echo "FILE=$file does not exist." >&2
+    exit 1
+  }
+  cp "$file" "$out"
+}
+
+# Check a payload source and turn it into what is stored, in _SECRETS_PAYLOAD.
+# Inline is the bytes as they are. File is gzip -n, which keeps no name or
+# timestamp, so the same input is the same bytes and an unchanged file can be
+# recognized. Both must fit Secret Manager's 64 KiB, and neither may be empty.
+_secrets_prepare() {
+  local kind="$1" src="$2" label="$3" size
+  if [ ! -s "$src" ]; then
+    echo "the value for $label is empty. Secret Manager would store it, and Terraform would see \"\": almost always a mistake." >&2
+    exit 1
+  fi
+  size=$(wc -c < "$src" | tr -d ' ')
+  if [ "$kind" = file ]; then
+    _SECRETS_PAYLOAD="$_SECRETS_WORK/payload.gz"
+    gzip -n -c "$src" > "$_SECRETS_PAYLOAD"
+    local gz
+    gz=$(wc -c < "$_SECRETS_PAYLOAD" | tr -d ' ')
+    if [ "$gz" -gt "$SECRETS_MAX_BYTES" ]; then
+      echo "$label is $gz bytes after gzip ($size before): over Secret Manager's $SECRETS_MAX_BYTES-byte (64 KiB) limit." >&2
+      exit 1
+    fi
+  else
+    _SECRETS_PAYLOAD="$src"
+    if [ "$size" -gt "$SECRETS_MAX_BYTES" ]; then
+      echo "$label is $size bytes: over Secret Manager's $SECRETS_MAX_BYTES-byte (64 KiB) limit. Inline secrets are not compressed." >&2
+      exit 1
+    fi
+  fi
+}
+
+# A label value: lowercased, anything gcloud would refuse made _, 63 characters at most.
+_secrets_label() {
+  printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '_' | cut -c1-63
+}
+
+# Create a secret holding the payload file as its first version. The labels
+# record where it came from for anyone auditing the project; nothing reads them.
+_secrets_create() {
+  local id="$1" payload="$2" kind="$3" var="$4"
+  local labels
+  labels="stack=$(_secrets_label "$V_STACK"),vars=$(_secrets_label "$V_VARS_ID"),var=$(_secrets_label "$var")"
+  [ "$kind" != file ] || labels="$labels,encoding=gzip"
+  gcloud secrets create "$id" --project="$V_SECRETS_PROJECT" \
+    --replication-policy=automatic --labels="$labels" --data-file=- < "$payload"
+}
+
+# Add the payload file as a new version of an existing secret.
+_secrets_add_version() {
+  local id="$1" payload="$2"
+  gcloud secrets versions add "$id" --project="$V_SECRETS_PROJECT" --data-file=- < "$payload"
+}
+
+# tf:secrets -- what discovery says this stack's secrets are, and where each
+# stands: in the cloud (CLOUD, the latest version), and on this machine (LOCAL:
+# yes, no, or stale when the version recorded in the secret tfvars header is
+# older than CLOUD).
+tf_secrets() {
+  _secrets_need_gcloud
+  _secrets_work_init
+
+  local rows
+  rows=$(_secrets_rows)
+
+  local manifest="$V_STACK_DIR/$V_SECRETS_FILE" tfvars="$V_STACK_DIR/$V_SECRET_TFVARS"
+  printf '%-10s %s\n' STACK "$V_STACK"
+  printf '%-10s %s\n' VARS_ID "$V_VARS_ID"
+  printf '%-10s %s\n' PROJECT "$V_SECRETS_PROJECT"
+  printf '%-10s %s\n' PREFIX "${V_SECRET_PREFIX:-(none)}"
+  if [ -f "$manifest" ]; then
+    printf '%-10s %s (present)\n' MANIFEST "$manifest"
+  else
+    printf '%-10s %s (absent)\n' MANIFEST "$manifest"
+  fi
+  if [ -f "$tfvars" ]; then
+    printf '%-10s %s (present)\n' TFVARS "$tfvars"
+  else
+    printf '%-10s %s (absent)\n' TFVARS "$tfvars"
+  fi
+  [ -n "$rows" ] || {
+    echo
+    echo "no secrets: no variable in $V_STACK_DIR is sensitive or ephemeral"
+    return 0
+  }
+
+  local table="$_SECRETS_WORK/table"
+  printf 'VAR\tKIND\tREQUIRED\tID\tDEST\tCLOUD\tLOCAL\n' > "$table"
+  local var kind required id dest tfvar cloud local_state rc shown_kind shown_dest lv
+  while IFS=$TAB read -r var kind required id dest tfvar; do
+    rc=0
+    _secrets_latest "$id" || rc=$?
+    case "$rc" in
+      0) cloud="$_SECRETS_VERSION" ;;
+      3) cloud='-' ;;
+      *) exit 1 ;;
+    esac
+    if _secrets_local_present "$var" "$kind" "$dest" "$tfvar"; then
+      local_state=yes
+      lv=$(_secrets_local_version "$tfvars" "$id")
+      case "$lv$cloud" in
+        *[!0-9]*|'') ;;
+        *) [ "$cloud" != '-' ] && [ -n "$lv" ] && [ "$lv" -lt "$cloud" ] && local_state=stale ;;
+      esac
+    else
+      local_state=no
+    fi
+    shown_kind="$kind"
+    [ "$tfvar" = yes ] || shown_kind=file-only
+    shown_dest="$dest"
+    [ "$kind" = file ] && shown_dest=$(_secrets_dest_path "$dest")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$var" "$shown_kind" "$required" "$id" "$shown_dest" "$cloud" "$local_state" >> "$table"
+  done <<EOF
+$rows
+EOF
+
+  echo
+  awk -F'\t' '
+    { r[NR] = $0; for (i = 1; i <= 7; i++) if (length($i) > w[i]) w[i] = length($i) }
+    END {
+      for (n = 1; n <= NR; n++) {
+        split(r[n], f, "\t")
+        line = ""
+        for (i = 1; i <= 7; i++) line = line sprintf("%-" w[i] "s", f[i]) (i < 7 ? "  " : "")
+        sub(/ +$/, "", line)
+        print line
+      }
+    }' "$table"
+}
+
+# tf:secrets:pull:ask -- fetch every secret this stack needs and write the secret
+# tfvars and the file-kind files. All or nothing: everything is fetched and
+# decoded into a scratch dir first, and nothing is written when a required
+# secret is missing, a fetch fails, or a destination is not ignored by git.
+tf_secrets_pull() {
+  _secrets_need_gcloud
+  _secrets_work_init
+
+  local rows
+  rows=$(_secrets_rows)
+  if [ -z "$rows" ]; then
+    echo "no secrets: no variable in $V_STACK_DIR is sensitive or ephemeral. Nothing to pull."
+    return 0
+  fi
+
+  local entries="$_SECRETS_WORK/entries" missing="$_SECRETS_WORK/missing"
+  : > "$entries"
+  : > "$missing"
+  local n=0 var kind required id dest tfvar rc
+  while IFS=$TAB read -r var kind required id dest tfvar; do
+    n=$((n + 1))
+    rc=0
+    _secrets_fetch "$id" "$_SECRETS_WORK/$n.raw" || rc=$?
+    case "$rc" in
+      0) printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$var" "$kind" "$id" "$dest" "$tfvar" "$_SECRETS_VERSION" >> "$entries" ;;
+      3)
+        if [ "$required" = yes ]; then
+          printf '%s\t%s\n' "$var" "$id" >> "$missing"
+        else
+          echo "skipping optional $var ($id): not in $V_SECRETS_PROJECT"
+        fi
+        ;;
+      *) exit 1 ;;
+    esac
+  done <<EOF
+$rows
+EOF
+  local total=$n
+
+  if [ -s "$missing" ]; then
+    echo "required secrets missing from $V_SECRETS_PROJECT, nothing written:" >&2
+    while IFS=$TAB read -r var id; do
+      echo "  $var ($id)" >&2
+      echo "    task tf:secrets:push:ask STACK=$V_STACK VARS=$V_VARS_ID VAR=$var" >&2
+    done < "$missing"
+    exit 1
+  fi
+
+  # Stage everything: the new secret tfvars and each file-kind payload, mode 600,
+  # fully decoded, so the writes at the end are only renames.
+  local tfvars="$V_STACK_DIR/$V_SECRET_TFVARS" staged="$_SECRETS_WORK/tfvars.new" width=0 ver magic
+  local files="$_SECRETS_WORK/files"
+  : > "$files"
+  while IFS=$TAB read -r n var kind id dest tfvar ver; do
+    [ "${#var}" -le "$width" ] || width=${#var}
+  done < "$entries"
+  {
+    echo "# written by: task tf:secrets:pull:ask STACK=$V_STACK VARS=$V_VARS_ID"
+    echo "# do not edit, do not commit. Regenerate with the same command."
+    while IFS=$TAB read -r n var kind id dest tfvar ver; do
+      printf '# %-*s = %s@%s\n' "$width" "$var" "$id" "$ver"
+    done < "$entries"
+  } > "$staged"
+  while IFS=$TAB read -r n var kind id dest tfvar ver; do
+    if [ ! -s "$_SECRETS_WORK/$n.raw" ]; then
+      echo "secret $id ($var) is empty in $V_SECRETS_PROJECT. Push a value for it." >&2
+      exit 1
+    fi
+    if [ "$kind" = inline ]; then
+      echo >> "$staged"
+      _secrets_encode_inline "$var" "$_SECRETS_WORK/$n.raw" >> "$staged"
+      continue
+    fi
+    magic=$(od -An -tx1 -N2 "$_SECRETS_WORK/$n.raw" | tr -d ' \n')
+    if [ "$magic" = 1f8b ]; then
+      gzip -dc "$_SECRETS_WORK/$n.raw" > "$_SECRETS_WORK/$n.out" || {
+        echo "secret $id ($var) starts like gzip but does not decompress." >&2
+        exit 1
+      }
+    else
+      cp "$_SECRETS_WORK/$n.raw" "$_SECRETS_WORK/$n.out"
+    fi
+    chmod 600 "$_SECRETS_WORK/$n.out"
+    printf '%s\t%s\n' "$n" "$(_secrets_dest_path "$dest")" >> "$files"
+    if [ "$tfvar" = yes ]; then
+      printf '%s' "$dest" > "$_SECRETS_WORK/$n.dest"
+      echo >> "$staged"
+      _secrets_encode_inline "$var" "$_SECRETS_WORK/$n.dest" >> "$staged"
+    fi
+  done < "$entries"
+  chmod 600 "$staged"
+
+  _secrets_gitignore
+  local path refused=0
+  while IFS=$TAB read -r n path; do
+    _secrets_check_ignored "$path" || refused=1
+    if [ -d "$path" ]; then
+      echo "refusing to write $path: it is a directory. Name a file in $V_STACK_DIR/$V_SECRETS_FILE." >&2
+      refused=1
+    fi
+  done < "$files"
+  _secrets_check_ignored "$(_secrets_norm "$tfvars")" || refused=1
+  [ "$refused" = 0 ] || exit 1
+
+  # Every parent dir first, so the one step that can fail on a bad path does so
+  # before anything is replaced; then only renames.
+  while IFS=$TAB read -r n path; do
+    mkdir -p "$(dirname "$path")"
+  done < "$files"
+  mkdir -p "$(dirname "$tfvars")"
+  local wrote=""
+  while IFS=$TAB read -r n path; do
+    mv -f "$_SECRETS_WORK/$n.out" "$path"
+    wrote="$wrote  $path"$'\n'
+  done < "$files"
+  mv -f "$staged" "$tfvars"
+  echo "pulled $(wc -l < "$entries" | tr -d ' ') of $total secrets from $V_SECRETS_PROJECT (VARS=$V_VARS_ID):"
+  echo "  $tfvars"
+  printf '%s' "$wrote"
+}
+
+# tf:secrets:push:ask -- store one secret: create it, or add a version when it
+# exists and the bytes differ. The source is FILE if given, else a file-kind
+# secret's own destination, else stdin, taken byte for byte.
+tf_secrets_push() {
+  local var="$1" file="${2:-}"
+  [ -n "$var" ] || {
+    echo "VAR is required: the variable the secret belongs to, e.g." >&2
+    echo "  task tf:secrets:push:ask STACK=$V_STACK VARS=$V_VARS_ID VAR=<var>" >&2
+    exit 1
+  }
+  _secrets_need_gcloud
+  _secrets_work_init
+
+  local rows row
+  rows=$(_secrets_rows)
+  row=$(printf '%s\n' "$rows" | awk -F'\t' -v v="$var" '$1 == v && !f { print; f = 1 }')
+  [ -n "$row" ] || {
+    echo "$var is not a secret of $V_STACK (VARS=$V_VARS_ID). A secret is a variable with" >&2
+    echo "sensitive = true or ephemeral = true, or a block in $V_STACK_DIR/$V_SECRETS_FILE." >&2
+    echo "To add one: task tf:secrets:new:ask STACK=$V_STACK VARS=$V_VARS_ID ID=$var" >&2
+    exit 1
+  }
+  local kind id dest
+  IFS=$TAB read -r var kind _ id dest _ <<EOF
+$row
+EOF
+
+  local src="$_SECRETS_WORK/src"
+  if [ -n "$file" ]; then
+    _secrets_read_file "$file" "$src"
+  elif [ "$kind" = file ]; then
+    local path
+    path=$(_secrets_dest_path "$dest")
+    [ -f "$path" ] || {
+      echo "$var is a file secret and $path does not exist. Pass FILE=<path> to push from elsewhere." >&2
+      exit 1
+    }
+    cp "$path" "$src"
+  elif [ -t 0 ]; then
+    echo "$var is an inline secret: pipe the value in, e.g." >&2
+    echo "  printf '%s' \"\$value\" | task tf:secrets:push:ask STACK=$V_STACK VARS=$V_VARS_ID VAR=$var" >&2
+    echo "or pass FILE=<path>." >&2
+    exit 1
+  else
+    cat > "$src"
+  fi
+  _secrets_prepare "$kind" "$src" "$var ($id)"
+
+  local rc=0
+  _secrets_exists "$id" || rc=$?
+  case "$rc" in
+    0)
+      local latest="$_SECRETS_WORK/latest"
+      rc=0
+      _secrets_fetch "$id" "$latest" || rc=$?
+      case "$rc" in
+        0)
+          if cmp -s "$latest" "$_SECRETS_PAYLOAD"; then
+            echo "$id already holds this value (version $_SECRETS_VERSION): nothing to add"
+            return 0
+          fi
+          ;;
+        3) ;;
+        *) exit 1 ;;
+      esac
+      _secrets_add_version "$id" "$_SECRETS_PAYLOAD"
+      echo "added a version to $id in $V_SECRETS_PROJECT"
+      ;;
+    3)
+      _secrets_create "$id" "$_SECRETS_PAYLOAD" "$kind" "$var"
+      echo "created $id in $V_SECRETS_PROJECT"
+      ;;
+    *) exit 1 ;;
+  esac
+}
+
+# tf:secrets:assert -- offline guard for anything that plans: refuse when a
+# required secret is not on this machine. A required inline secret needs a
+# `<var> =` line in the secret tfvars, a required file secret needs its file.
+tf_secrets_assert() {
+  local rows
+  rows=$(_secrets_rows)
+  [ -n "$rows" ] || return 0
+
+  local tfvars="$V_STACK_DIR/$V_SECRET_TFVARS" missing=""
+  local var kind required id dest tfvar
+  while IFS=$TAB read -r var kind required id dest tfvar; do
+    [ "$required" = yes ] || continue
+    _secrets_local_present "$var" "$kind" "$dest" "$tfvar" && continue
+    if [ "$kind" = file ] && [ ! -f "$(_secrets_dest_path "$dest")" ]; then
+      missing="$missing  $var: $(_secrets_dest_path "$dest") does not exist"$'\n'
+    else
+      missing="$missing  $var: no '$var =' line in $tfvars"$'\n'
+    fi
+  done <<EOF
+$rows
+EOF
+  [ -n "$missing" ] || return 0
+
+  echo "required secrets are not on this machine (STACK=$V_STACK VARS=$V_VARS_ID):" >&2
+  printf '%s' "$missing" >&2
+  echo "fetch them with: task tf:secrets:pull:ask STACK=$V_STACK VARS=$V_VARS_ID" >&2
+  exit 1
+}
+
+# tf:secrets:setup -- one-time, idempotent setup of Secret Manager for the repo.
+# Each step reads before it writes, so a second run changes nothing.
+tf_secrets_setup() {
+  _secrets_dir_clean "$V_SECRETS_DIR" >/dev/null || exit 1
+  _secrets_need_gcloud
+
+  local p="$V_SECRETS_PROJECT" api=secretmanager.googleapis.com enabled
+  enabled=$(gcloud services list --enabled --project="$p" --filter="config.name=$api" \
+              --format='value(config.name)' </dev/null)
+  if [ -n "$enabled" ]; then
+    echo "$api already enabled in $p"
+  else
+    echo "enabling $api in $p"
+    gcloud services enable "$api" --project="$p"
+  fi
+
+  if gcloud secrets list --project="$p" --limit=1 >/dev/null </dev/null; then
+    echo "Secret Manager in $p is reachable"
+  else
+    echo "cannot list secrets in $p. You need:" >&2
+    echo "  roles/secretmanager.admin           to create secrets and add versions" >&2
+    echo "  roles/secretmanager.secretAccessor  to pull them" >&2
+    exit 1
+  fi
+
+  _secrets_gitignore
+
+  echo "secrets are ready. Next:"
+  echo "  task tf:secrets:new:ask ID=<var>  create a secret, and declare its variable if needed"
+  echo "  task tf:secrets                   see what a stack needs and what is where"
+}
+
+# tf:secrets:new:ask -- create a secret and, if no variable declares it yet, declare
+# one, sensitive and ephemeral: an ephemeral value never reaches state or a plan
+# file, and tofu refuses it anywhere that would put it there, so a config that
+# needs the value in a regular resource argument drops `ephemeral` by hand.
+# ID is the variable name (or a file-only manifest label). The value comes from
+# FILE, else a hidden prompt on a terminal, else stdin. Ordered so that a
+# failure leaves nothing half done: all checks, then the secret, then the
+# declaration, then a pull to put the value where Terraform will find it.
+tf_secrets_new() {
+  local var="$1" file="${2:-}"
+  [ -n "$var" ] || {
+    echo "ID is required: the variable name for the new secret, e.g." >&2
+    echo "  task tf:secrets:new:ask STACK=$V_STACK VARS=$V_VARS_ID ID=db_password" >&2
+    exit 1
+  }
+  case "$var" in
+    [!A-Za-z_]*|*[!A-Za-z0-9_-]*)
+      echo "ID=$var is not a valid Terraform variable name (letters, digits, _ and -; not starting with a digit)." >&2
+      exit 1
+      ;;
+  esac
+  _secrets_need_gcloud
+  _secrets_work_init
+
+  local rows row kind=inline id declared=no
+  rows=$(_secrets_rows)
+  row=$(printf '%s\n' "$rows" | awk -F'\t' -v v="$var" '$1 == v && !f { print; f = 1 }')
+  if [ -n "$row" ]; then
+    declared=yes
+    IFS=$TAB read -r _ kind _ id _ _ <<EOF
+$row
+EOF
+  else
+    if _secrets_variables "$V_STACK_DIR" | awk -F'\t' -v v="$var" '$2 == v && $3 == 0 { f = 1 } END { exit !f }'; then
+      echo "variable \"$var\" exists in $V_STACK_DIR but is neither sensitive nor ephemeral. Set sensitive = true on it to make it a secret." >&2
+      exit 1
+    fi
+    id="$V_SECRET_PREFIX$V_STACK-$V_VARS_ID-$var"
+    case "$id" in
+      *[!A-Za-z0-9_-]*)
+        echo "the Secret Manager id \"$id\" is not valid (letters, digits, _ and - only)." >&2
+        echo "Declare $var in $V_STACK_DIR/$V_SECRETS_FILE with an id of your own." >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  local rc=0
+  _secrets_exists "$id" || rc=$?
+  case "$rc" in
+    0)
+      echo "secret $id already exists in $V_SECRETS_PROJECT. To store a new version:" >&2
+      echo "  task tf:secrets:push:ask STACK=$V_STACK VARS=$V_VARS_ID VAR=$var" >&2
+      exit 1
+      ;;
+    3) ;;
+    *) exit 1 ;;
+  esac
+
+  local src="$_SECRETS_WORK/src"
+  if [ -n "$file" ]; then
+    _secrets_read_file "$file" "$src"
+  elif [ -t 0 ]; then
+    local a b
+    printf 'value for %s (one line, hidden): ' "$var" >&2
+    IFS= read -rs a
+    echo >&2
+    printf 'again: ' >&2
+    IFS= read -rs b
+    echo >&2
+    [ "$a" = "$b" ] || {
+      echo "the two entries differ; nothing created." >&2
+      exit 1
+    }
+    printf '%s' "$a" > "$src"
+    a=
+    b=
+  else
+    cat > "$src"
+  fi
+  _secrets_prepare "$kind" "$src" "$var ($id)"
+
+  _secrets_create "$id" "$_SECRETS_PAYLOAD" "$kind" "$var"
+  echo "created $id in $V_SECRETS_PROJECT"
+
+  if [ "$declared" = no ]; then
+    # Staged and renamed into place like the tfvars, but this file is committed
+    # source, not a secret: an existing one keeps its mode (cp -p), a new one
+    # gets the caller's umask rather than 077.
+    local tf="$V_STACK_DIR/$V_SECRETS_TF" staged="$_SECRETS_WORK/secrets.tf"
+    if [ -f "$tf" ]; then
+      cp -p "$tf" "$staged"
+      [ -z "$(tail -c 1 "$staged")" ] || echo >> "$staged"
+    else
+      ( umask "$_SECRETS_UMASK"; : > "$staged" )
+      echo '# Secret variables, declared by task tf:secrets:new:ask. Values live in Secret Manager.' >> "$staged"
+    fi
+    {
+      echo
+      echo "variable \"$var\" {"
+      echo '  type      = string'
+      echo '  sensitive = true'
+      echo '  ephemeral = true'
+      echo '}'
+    } >> "$staged"
+    mv -f "$staged" "$tf"
+    echo "declared variable \"$var\" in $tf"
+  fi
+
+  rc=0
+  bash "$0" tf_secrets_pull || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "the secret $id itself was created; the pull above failed (exit $rc)." >&2
+    exit "$rc"
+  fi
+}
 
 cmd="${1:-}"
 [ -n "$cmd" ] && shift || true

@@ -203,6 +203,85 @@ permission rules added to `.claude/settings.local.json` are not removed
 by restoring the Taskfile either; decide separately whether they should
 stay.
 
+## 6. Secrets: a repo that already wires `*.secret.tfvars`
+
+`tf:secrets:*` is the toolkit's own secret management (see
+`references/tf-stack.md`, "Secrets"): a `variable` with `sensitive = true`
+or `ephemeral = true` is a secret, one Secret Manager secret per variable,
+written to `variables/<vars_id>.secret.tfvars`, which `VAR_FILES` appends
+**last**. A target repo may already carry its own arrangement for a secret
+tfvars, by hand or from the older dacbots `dev-secrets` skill. That skill
+appends the secret tfvars as an explicit **last entry in each `VARS_MAP`
+line**, gitignores `secrets/*`, and round-trips the file through
+`secrets/manifest.txt` and `secrets:upload`/`secrets:download` as one
+whole-file secret per environment (`tfvars-<env>`). Look for it before
+installing: `grep -n 'secret.tfvars' Taskfile.yml .gitignore`, any
+`secrets/manifest.txt`, any `secrets:*` task, and `-var-file=` flags naming
+a `*.secret.tfvars` in CI, the Makefile or `scripts/`.
+
+**What the new `VAR_FILES` does with such a line** (tested against the
+shipped script; the third argument is `variables/<vars_id>.secret.tfvars`):
+
+| `VARS_MAP` entry | File present | File absent |
+|---|---|---|
+| the current `variables/<vars_id>.secret.tfvars`, last | skipped in place, appended once, last: **not passed twice** | skipped; the guards skip it too, so a clean clone can still pull |
+| the same, anywhere else in the list | same: skipped, then appended last | same |
+| a glob that matches it (`variables/dev*.tfvars`) | never loads it in place; appended last | not applicable |
+| a *different* `*.secret.tfvars` (another vars id's, a per-feature one) | **never loaded**; `tf:vars:assert` prints a note naming it | same note |
+
+So an explicit entry for the current file is harmless, before the first
+pull as well as after. `tf:vars:assert` and `VARS_IDS_PRESENT` skip every
+`*.secret.tfvars` entry the way `VAR_FILES` does, so a clean clone can
+still run `tf:secrets:pull:ask` and `tf:secrets:new:ask` (both run
+`tf:vars:assert` first), and `tf:plan:all` and `tf:verify` still see the
+environment. A `*.secret.tfvars` that is not the current one is never
+loaded, even when the file exists: tofu then plans from the variables'
+defaults, or prompts. `tf:vars:assert` prints a note naming the entry but
+does not fail, which is why removing it is a step of the migration and
+not left to the guards.
+
+**Migrate, per repo:**
+
+1. **Take the secret tfvars out of every `VARS_MAP` line.** Leave the
+   non-secret files and their order alone; `VAR_FILES` adds the secret
+   tfvars last by itself. Confirm with `task tf:vars:map`, then `task
+   tf:vars STACK=<s> VARS=<id>` on a clone where the file is absent.
+2. **Rename any other `*.secret.tfvars` the maps named.** Either to
+   `<vars_id>.secret.tfvars` (only one per vars id loads) or to a name
+   not ending `.secret.tfvars`, if it is not a secret and is meant to be
+   committed.
+3. **Turn each value into a variable.** Mark the variable
+   `sensitive = true` or `ephemeral = true` (ephemeral needs OpenTofu
+   1.11 or Terraform 1.10 and a stack `required_version` that says so;
+   see "Ephemeral by default" in `references/tf-stack.md`), then store its
+   value with `task tf:secrets:new:ask STACK=<s> VARS=<id> ID=<var>` (or
+   `tf:secrets:push:ask` for an existing secret). The ids are
+   `<SECRET_PREFIX><stack>-<vars_id>-<var>`, one per variable, so the
+   old whole-file `tfvars-<env>` secret does not map onto them: the user
+   reads each value out of it and pushes it. Those are real Secret
+   Manager calls and are the user's to run, not this skill's.
+   Delete the old secret tfvars entry from `secrets/manifest.txt` once its
+   values are moved, so the two systems do not both write one file.
+4. **Reconcile `.gitignore`.** `tf:secrets:setup` appends `*.secret.tfvars`
+   (already there) and `/<SECRETS_DIR>/`, `/secrets/` by default. The
+   `dev-secrets` block `secrets/*`, `!secrets/manifest.txt` cannot coexist
+   with it: git cannot re-include a file whose directory is ignored, so a
+   repo-root `secrets/manifest.txt` becomes ignored (checked with `git
+   check-ignore -v`), and the toolkit's file secrets would land in the
+   same directory. Either move the old directory to another name
+   (`secret-files/`) in its tasks and manifest, or set `SECRETS_DIR` to
+   another name for the toolkit, or retire `secrets:upload`
+   and `secrets:download` by converting what they carry to `tf:secrets:*`
+   (a file some other tool reads is a *file-only* secret in
+   `variables/<vars_id>.secrets.hcl`).
+5. **Drop any hand-added `-var-file=` from apply.** The `dev-secrets`
+   skill warned never to give an `:ask` apply task a var-file, because
+   `tf:apply:ask` used to take none. It does now (a saved plan holds no
+   ephemeral value), and the var files come from `VAR_FILES`, so there is
+   nothing to thread by hand, here or in a CI step that calls the task.
+6. **Verify offline:** `task tf:vars` (the secret tfvars last under
+   `FILES` once pulled), `task tf:secrets:assert`, `task tf:verify`.
+
 ## Strip list
 
 Everything below is intentionally absent from the assets this skill
@@ -213,13 +292,17 @@ hand-edited copy of the asset — treat it as a bug, not a style choice.
 **Functions dropped from `tf-stack.sh` (5):** `tf_export_show`,
 `tf_export_publish`, `tf_export_query`, `tf_export_query_json`
 (BigQuery publishing), `tf_refresh_diff` (Cloud Asset Inventory-backed
-freshness checking). None of the surviving 31 functions call these, and
+freshness checking). None of the surviving 62 functions call these, and
 none of the surviving `tf:*` tasks depend on them. That strip is the
 only transformation: `assets/tf-stack.sh` is the source repo's
 `scripts/tf-stack.sh` with those five functions removed and nothing
-else changed, so 31 of its 36 functions survive byte for byte.
+else changed, so 62 of its 67 functions survive byte for byte. The
+secrets functions are among the survivors (`SECRETS_DISCOVER`,
+`tf_secrets`, `tf_secrets_setup`, `tf_secrets_new`, `tf_secrets_pull`,
+`tf_secrets_push`, `tf_secrets_assert` and 23 `_secrets_*` helpers), as
+is the `_hcl_blocks` reader they share.
 
-**Tasks dropped (21), by group:**
+**Tasks dropped (23), by group:**
 
 - `tf:export:show`, `:publish`, `:run`, `:fields`, `:query`,
   `:query:json`, `:test` (7) — the BigQuery export pipeline.
@@ -231,6 +314,12 @@ else changed, so 31 of its 36 functions survive byte for byte.
   STACK=<s> VARS=<env>` instead.
 - `tf:hack` (1) — a debug scratch task with no `desc:`, so it never
   appeared in `task --list` even in the source.
+- `tf:fmt:all` (1) — formatted the source repo's own `TF_DIRS` list;
+  `tf:fmt` (one stack) and `tf:fmt:check:all` (everything) ship instead.
+- `tf:secrets:test` (1) — runs the source repo's own offline suite for
+  the secrets tasks (`scripts/tests/tf-secrets.sh` and its fake
+  `gcloud`), which this skill does not ship. The six other
+  `tf:secrets:*` tasks ship.
 
 **Namespaces dropped whole:** `vpcsc:`, `org:`, `cai:`, `wif:`, `iam:`,
 `projects:`, and any per-repro debug namespace. None of these are part
@@ -239,15 +328,20 @@ of tf-stack; they belonged to the source repo's own infrastructure.
 **Top-level `test` task:** the fragment ships none — `test` comes from
 the base Taskfile, and should depend only on `tf:fmt:check:all` and
 `tf:validate:all` for the tf side — the offline tf checks. The
-source's `test` also depended on `org:test`, `tf:export:test`, and
-`tf:refresh-diff:test`, all of which tested namespaces this skill does
-not ship.
+source's `test` also depended on `org:test`, `tf:export:test`,
+`tf:refresh-diff:test` and `tf:secrets:test`, all of which tested
+namespaces or suites this skill does not ship.
 
 **Anchor keys dropped:** the `tf_stack_env` anchor carries the keys the
-31 surviving functions read, plus `V_ROOT_DIR` for the repo root.
+62 surviving functions read (the secrets ones among them:
+`V_SECRETS_PROJECT`, `V_SECRET_PREFIX`, `V_SECRETS_DIR`, `V_SECRETS_FILE`,
+`V_SECRET_TFVARS`, `V_SECRETS_TF`, `V_USER_WORKING_DIR`), plus
+`V_ROOT_DIR` for the repo root.
 Dropped: `V_ORG_ID`, `V_PLUGIN_CACHE`, `V_REFRESH_DIFF_DIR`,
 `V_REFRESH_DIFF_TYPES`, `V_VAR_FILES` — each read only by a dropped
-function or a dropped namespace. Every key that stays
+function or a dropped namespace. (`VAR_FILES` itself, the Taskfile var,
+stays: the plan, apply, refresh and destroy tasks pass it to tofu. Only
+its `V_` copy went.) Every key that stays
 keeps its source spelling, `V_BOOTSTRAP_PROJECT` included: it names the
 project that owns the state bucket, which is what `tf_setup` still reads
 it for.

@@ -25,6 +25,11 @@ Nothing to build or test yet. The `dev-tf` fixture smoke test lives at
 by path relative to the skill dir. `dev-tasks/SKILL.md` is the canonical
 Taskfile convention spec — point readers there, not at `wip/tasks.md`.
 
+`dev-tf` is written in the gcp-homaway repo (`skills/dev-tf/`, beside the
+upstream `scripts/tf-stack.sh`) and copied here by `task dev-tf:publish`
+there. Don't edit `plugins/dacbots/skills/dev-tf/` in this repo — the next
+publish overwrites it, and refuses to run while it has uncommitted changes.
+
 <!-- dev-permissions:fs-nav -->
 ## Filesystem navigation
 
