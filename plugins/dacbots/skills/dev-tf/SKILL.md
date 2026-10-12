@@ -1,6 +1,6 @@
 ---
 name: dev-tf
-description: Replicate the tf-stack terraform/opentofu toolkit into a repo. Copies a proven scripts/tf-stack.sh and a go-task tf:* block out of this skill, detects greenfield vs. update, detects the repo's shape (single stack, multi-env, multi-stack) by locating each root module's backend in a config file or inline in a .tf, backs up the Taskfile and freezes the CI-called task names behind gated compat shims on update, derives VARS_MAP/BACKEND_MAP from the tfvars and backend configs the repo actually has, and installs secret management on GCP Secret Manager (tf:secrets:*), and verifies the install offline with task tf:verify. Use when a repo needs terraform or opentofu tasks, when adopting the STACK/VARS/BACKEND stack convention, when harmonizing a hand-rolled tf Taskfile, or asks to replicate tf-stack. Args: optional hints (greenfield, update, tofu, terraform) to force the mode or toolchain.
+description: Install or update the tf-stack terraform/opentofu toolkit (scripts/tf-stack.sh plus a go-task tf:* block with STACK/VARS/BACKEND selection, guards, and tf:secrets:* on GCP Secret Manager) in a repo. UPDATE, whenever the repo already has a dev-tf install - identifies the installed release, overwrites the toolkit-owned files, keeps the repo's own settings, retires local one-offs of features the release ships, verifies and reports. INSTALL otherwise - GREENFIELD, or MIGRATE a hand-rolled terraform Taskfile (tracked backup, CI task names kept behind gated shims); detects the repo's shape and each root module's backend, derives VARS_MAP/BACKEND_MAP from the files present, verifies offline with task tf:verify. Use when a repo needs terraform or opentofu tasks, to adopt the STACK/VARS/BACKEND convention, to migrate a repo's terraform tasks to dev-tf, to replicate tf-stack, or to update or upgrade dev-tf where it is installed ("update dev-tf in this repo"). Args: update, migrate, greenfield, tofu, terraform.
 user-invocable: true
 allowed-tools:
   - Read
@@ -16,6 +16,8 @@ allowed-tools:
   - Bash(bash -n *)
   - Bash(git mv *)
   - Bash(git status *)
+  - Bash(git log *)
+  - Bash(git hash-object *)
   - Bash(git ls-files *)
   - Bash(git check-ignore *)
   - Bash(task --list*)
@@ -32,30 +34,32 @@ allowed-tools:
   - Bash(scripts/tf-stack.sh BACKEND_INLINE_FILE*)
   - Bash(bash scripts/tf-stack.sh help*)
   - Bash(cmp *)
+  - Bash(diff *)
+  - Bash(git diff *)
   - Bash(tofu version*)
 ---
 
 # /dev-tf — replicate the tf-stack toolkit into a repo
 
-Installs three things this skill has already proven elsewhere: the `tf:*`
-go-task block and its variable-resolution chain, `scripts/tf-stack.sh` (the
-functions those tasks call by name), and the `<STACKS_DIR>/<name>/` layout
+Installs, or updates, three things this skill has already proven elsewhere: the
+`tf:*` go-task block and its variable-resolution chain, `scripts/tf-stack.sh`
+(the functions those tasks call by name), and the `<STACKS_DIR>/<name>/` layout
 convention (`STACKS_DIR` defaults to `stacks`) that keeps each root module's
-`variables/*.tfvars` and `*.backend.hcl` self contained. On top of that it
-adds selection of a stack by name, guards that run before tofu ever touches a
-backend, collision-free `TF_DATA_DIR`/plan file names across every stack ×
-vars × backend × toolchain combination, and secret management: a `variable`
-with `sensitive = true` or `ephemeral = true` is a secret, stored one per
-variable in GCP Secret Manager (`tf:secrets:*`). **This skill copies artifacts; it
-does not regenerate them.** See
-[`/dev-tasks`](../dev-tasks/SKILL.md) for the base Taskfile conventions and
-permission-rule mechanics this skill builds on, and
+`variables/*.tfvars` and `*.backend.hcl` self contained. On top of that it adds
+selection of a stack by name, guards that run before tofu ever touches a
+backend, collision-free `TF_DATA_DIR`/plan file names across every stack × vars
+× backend × toolchain combination, and secret management: a `variable` with
+`sensitive = true` or `ephemeral = true` is a secret, stored one per variable in
+GCP Secret Manager (`tf:secrets:*`). **This skill copies artifacts; it does not
+regenerate them.** See [`/dev-tasks`](../dev-tasks/SKILL.md) for the base
+Taskfile conventions and permission-rule mechanics, and
 [`/dev-codify`](../dev-codify/SKILL.md) for why the logic ships as one dispatch
-script rather than inline `cmds` scattered across tasks.
+script rather than inline `cmds`.
 
-Arguments: `$ARGUMENTS` — optional hints. Mode: `greenfield`, `update`.
-Toolchain: `tofu`, `terraform`. With no args, detect both from the repo. The
-backend is never an argument — it is read off the repo's own backend
+Arguments: `$ARGUMENTS` — optional hints. Mode: `update` (update an existing
+install), `migrate` (the migration path of INSTALL; what `update` used to mean),
+`greenfield`. Toolchain: `tofu`, `terraform`. With no args, detect both from the
+repo. The backend is never an argument — it is read off the repo's own backend
 configuration in step 2.
 
 ---
@@ -70,26 +74,27 @@ configuration in step 2.
 | `assets/stack/*` | `<STACKS_DIR>/<name>/` | greenfield only |
 | `assets/backends/gcs.hcl` | `variables/<id>.backend.hcl` | templated |
 | `references/tf-stack.md` | `docs/tf-stack.md` | adapted |
-| `references/migration.md` | read on demand | never copied |
+| `references/migration.md` | read on demand (MIGRATE) | never copied |
+| `references/releases.md` | read on demand (UPDATE) | never copied |
 | `*.secret.tfvars`, `/secrets/` | `.gitignore` | two lines, each guarded by `grep -qxF` (step 10) |
 
 `assets/tf-stack.sh` is the upstream `scripts/tf-stack.sh` minus five
 functions specific to its home repo; the 62 that remain are the ABI: 31 core
 names (selection, guards, init, setup) and 31 that carry secret management
 (`SECRETS_DISCOVER`, `_hcl_blocks`, `tf_secrets*`, 23 `_secrets_*` helpers).
-Step 2 runs `bash scripts/tf-stack.sh help` in the target and reads that name
-list to tell a prior `/dev-tf` install apart from a hand-written script of the
-same name.
+`bash scripts/tf-stack.sh help` lists them. Every release since 0.3.0 carries
+22 of them, which is how Modes tells a prior install, of any release, from a
+hand-written script of the same name.
 
 ---
 
 ## What tf-stack is
 
-| Part | What it holds | What breaks if wrong |
-|---|---|---|
-| `tf:*` tasks + variable chain | Selection (`STACK`/`VARS`/`BACKEND`/`TF`), guards, init/plan/apply/validate wiring, `tf:secrets:*` | A misnamed var silently no-ops a task instead of erroring |
-| `scripts/tf-stack.sh` | The 14 uppercase resolvers plus every function a Taskfile `sh:` block calls by name | Renaming a function breaks variable evaluation for every task, with an opaque `unknown command` |
-| `<STACKS_DIR>/<name>/` layout | One root module per stack under the one dir `STACKS_DIR` names (default `stacks`), each with its own `variables/*.tfvars` and `variables/*.backend.hcl` | Two stacks sharing a data dir or plan file corrupt each other's plan/state silently |
+Three parts: the `tf:*` tasks with their variable chain (a misnamed var silently
+no-ops a task), `scripts/tf-stack.sh` (the 14 uppercase resolvers and every
+function a Taskfile `sh:` block calls by name), and one root module per stack
+under `STACKS_DIR` (two stacks sharing a data dir or plan file corrupt each
+other's plan/state silently).
 
 | Selector | Picks | Source |
 |---|---|---|
@@ -111,6 +116,31 @@ as a state-affecting decision, not a convenience flag.
 
 ## Modes (pick before you write anything)
 
+Two modes, decided first, before any other detection:
+
+| Mode | Signal | What it does |
+|---|---|---|
+| UPDATE | `scripts/tf-stack.sh` defines all 22 **base names**, the ABI every release since 0.3.0 carries (listed in `references/releases.md`, 0.3.0); a current install defines 62 | brings the existing install up to the current release — see "Updating an install" |
+| INSTALL | everything else | puts the toolkit into a repo for the first time, on the two axes below; resolves to GREENFIELD or MIGRATE |
+
+Check by reading before running: Grep `scripts/tf-stack.sh` for the base
+names' definitions (`^<name>\(\)`). All 22 → a prior install, whatever
+release; it is never INSTALL's to migrate, even though its Taskfile invokes
+tofu. None → someone's own script; some → unclear: either way ask, and never
+overwrite it silently. Only a prior install is run (`bash scripts/tf-stack.sh
+help`, which prints to stderr and exits 1 by design).
+
+`$ARGUMENTS`: `update` on a repo with no prior install stops and says so,
+offering INSTALL and naming what it would resolve to (GREENFIELD or MIGRATE).
+`migrate` or `greenfield` on a repo with a prior install asks before going on,
+recommending UPDATE: MIGRATE would treat the installed `tf:*` block as legacy,
+back it up and re-derive every repo-owned value instead of carrying it.
+Otherwise `migrate`/`greenfield` force INSTALL's Taskfile axis only; the shape
+axis is always detected. Announce the resolved mode (and, for INSTALL, each
+axis and whether it was detected or forced) before writing anything.
+
+### INSTALL: the two axes
+
 *Taskfile axis* — governs rollback and CI obligations:
 
 | Signal | Value | Obligations |
@@ -118,13 +148,12 @@ as a state-affecting decision, not a convenience flag.
 | no `Taskfile.{yml,yaml}` | `tf-new` | none; write freely |
 | a Taskfile with no task invoking `terraform`/`tofu` | `tf-add` | backup; leave every non-tf task untouched |
 | a Taskfile with tasks invoking `terraform`/`tofu`, **under any name** | `tf-replace` | backup, frozen CI-name list, remove-then-replace |
-| `scripts/tf-stack.sh` whose `help` lists the 31 core ABI names | `tf-refresh` | diff-only harmonize; no backup, no shims |
 
 *Shape axis* — **which pattern the repo already uses**, hence what stack
-structure it migrates to. This is a detection, not a decision: two counts,
+structure it is installed as. This is a detection, not a decision: two counts,
 root modules and backends per root module. Step 2 says how to get them.
 
-| Root modules | Backends each | Value | Migrates to |
+| Root modules | Backends each | Value | Installs as |
 |---|---|---|---|
 | — (no `*.tf`) | — | `shape-none` | scaffold `<STACKS_DIR>/main/` (default `stacks/main/`) |
 | 1 | 1 | `shape-single` | one stack; `variables/<stack>.tfvars`; both maps empty |
@@ -143,25 +172,19 @@ Two degenerate readings, both common:
   values are one module; directories that declare different resources, or
   call different sets of shared `modules/`, are different stacks.
 
-*Placement* is a consequence of the shape, decided **per root module** in step
-8 — each one either already sits at `<STACKS_DIR>/<name>/` or gets a proposed
-`git mv` into it. `STACKS_DIR` (a Taskfile var, default `stacks`) names the
-**one** dir every stack lives under — it is a repo-wide knob, not a per-stack
-one: every root module must share that same parent, so a repo whose modules
+*Placement* follows from the shape and is settled per root module in step 8.
+`STACKS_DIR` (a Taskfile var, default `stacks`) names the **one** dir every
+stack lives under — a repo-wide knob, not a per-stack one. Modules that
 already sit together under one consistent dir (`terraform/`, `infra/`,
-`live/`) needs no `git mv` — point `STACKS_DIR` at it as-is, or rename it to
-the conventional `stacks/` first; step 8 asks the user which. The one case
-that still forces a move: a single root module sitting directly
-at that shared parent, most often the repo root itself, with no name of its
-own — a dir cannot be both the list of stacks and a stack's own files, so
-step 8 infers a name and moves it one or two levels, user-confirmed either
-way. Only modules that do **not** already share one common parent (or share
-it with no name of their own) get a proposed move. This is never a reason to
-skip the inspection above.
+`live/`) are **already placed**: `STACKS_DIR` points at that dir as-is, or it
+is renamed to `stacks/` (step 8 asks which). What still forces a move is a
+module whose `.tf` files sit directly in that shared parent, most often the
+repo root, with no name of its own (a dir cannot be both the list of stacks
+and a stack's own files), or modules that share no common parent. This is
+never a reason to skip the inspection above.
 
 `GREENFIELD = tf-new + (shape-none | every root module already placed)`.
-Everything else is UPDATE. `tf-refresh` is its own lighter path. Ambiguity →
-AskUserQuestion, never a guess.
+Everything else is MIGRATE. Ambiguity → AskUserQuestion, never a guess.
 
 ---
 
@@ -194,9 +217,7 @@ AskUserQuestion, never a guess.
    `references/migration.md`'s strip list before writing anything.
 10. **Zero `__DEV_TF_*__` tokens remain.** Grep is the check, not a read-through.
 
----
-
-## Migration safety rules (UPDATE only)
+## Migration safety rules (MIGRATE only)
 
 - **Back up before touching anything,** and the backup must be **tracked, not
   gitignored** — a gitignored backup satisfies nothing.
@@ -215,12 +236,13 @@ AskUserQuestion, never a guess.
 
 ## Steps
 
-### 1. Locate this skill's assets
+### 1. Locate this skill's assets (both modes)
 
 Resolve in this order, stopping at the first hit:
 
 1. `${CLAUDE_PLUGIN_ROOT}/skills/dev-tf/`
-2. `ls ~/.claude/plugins/cache/*/dacbots/*/skills/dev-tf/`
+2. `ls ~/.claude/plugins/cache/*/dacbots/*/skills/dev-tf/` (the cache keeps
+   old versions too: take the highest)
 3. `~/.claude/plugins/marketplaces/*/plugins/dacbots/skills/dev-tf/`
 4. `*/plugins/dacbots/skills/dev-tf/` under this repo
 5. else ask the user where the skill lives.
@@ -232,14 +254,113 @@ version-keyed cache — tell the user to bump `plugin.json` and run `/plugin
 marketplace update dacetplace`.
 
 For each asset, **Read it from the resolved path and Write it into the target
-repo** — treat this as the primary method, since it does not depend on
-`${CLAUDE_PLUGIN_ROOT}` resolving inside a `Bash` invocation, which this skill
-has not verified. Fall back to `Bash(cp *)` only once the resolved source path
-is confirmed present on disk. **Never reconstruct a missing asset from
-memory** — a missing or truncated file at every resolution candidate means
-stop and ask, not improvise a replacement.
+repo** — this does not depend on `${CLAUDE_PLUGIN_ROOT}` resolving inside a
+`Bash` invocation, which this skill has not verified. Fall back to `Bash(cp *)`
+only once the resolved source path is confirmed on disk. **Never reconstruct a
+missing asset from memory**: a missing or truncated file at every candidate
+means stop and ask.
 
-### 2. Detect the mode (both axes)
+---
+
+## Updating an install (UPDATE)
+
+Brings a repo that already has a dev-tf install up to this skill's current
+release. After step 1 it follows its own steps, U1–U7, not steps 2–11, and
+none of MIGRATE's machinery: no backup, no CI-name freezing, no shape
+detection, no placement moves, no map derivation — unless a release entry in
+`references/releases.md` says it requires one. It makes no cloud call and runs
+no `tf:secrets:*` task that writes; everything it changes stays in the working
+tree for review.
+
+| Category | What | On update |
+|---|---|---|
+| Toolkit-owned | `scripts/tf-stack.sh`, `scripts/tf-verify.sh`; every anchor key, `env:` key, var and task the shipped block defines (`tmp:setup` included) and any a release dropped; the block's `.gitignore` lines; `docs/tf-stack.md` | **The release wins.** Overwrite without asking; list local edits that were overwritten in the report |
+| Repo-owned | the eight project values (INSTALL step 6); the `STACKS_DIR`, `SECRETS_PROJECT`, `SECRET_PREFIX`, `SECRETS_DIR`, `NO_COLOR` and `NO_LOCK` settings; `VARS_MAP`/`BACKEND_MAP`; which CONDITIONAL sections the install kept (dual-toolchain, gcs `tf:setup`) and whether it dropped the five gcloud secrets tasks; CI compat shims, the `aliases:` it added to shipped tasks, and their permission rules; non-tf tasks; the stacks themselves | **Kept**, except what a release entry's **Replaces** names in them |
+| Local one-offs of a shipped feature | e.g. hand-rolled `secrets:*` tasks and `secrets/manifest.txt` from the older dacbots `dev-secrets` skill, `*.secret.tfvars` entries in `VARS_MAP`, a local patch to `tf-stack.sh` | **The release wins.** Remove and replace; report what was retired and flag any behaviour the shipped version lacks |
+| Extra local `tf:*` tasks the block doesn't ship | | Kept, and checked against the new var chain |
+
+A setting is repo-owned when its value differs from the shipped default; where
+a release renamed one, carry the value to the new name. Where two rows claim
+one thing, the release entry wins: for example `VARS_MAP` is kept, minus its
+`*.secret.tfvars` entries.
+
+**U1. Identify the installed release** from the signatures in
+`references/releases.md`; its header says how (`git hash-object
+scripts/tf-stack.sh` against each entry's blob is exact for an unedited
+script). The releases newer than it are the ones being applied; the later
+steps read their entries. A script defining names the newest entry lacks is
+either locally patched (its history, as in U3, shows a local commit adding
+them) or an install newer than this skill: then stop and tell the user to
+update the plugin, since a downgrade is not an update.
+
+**U2. Short-circuit.** The install is current when the installed release is
+the newest entry, both scripts match their assets byte for byte (`cmp`), the
+Taskfile's toolkit-owned vars and tasks match the block's filled with the
+repo's values, no `__DEV_TF_*__` token survives, no "Replaces" grep (U3) finds
+a one-off, and `task tf:verify` passes. Report that and stop.
+
+**U3. Inventory the target** into the four categories; nothing is written yet.
+
+- Diff each toolkit-owned file against its asset (`diff`). A script whose blob
+  matches no entry carries a local patch. The diff against the current asset
+  mixes it with the releases' own changes; the repo's history (`git log -p --
+  scripts/tf-stack.sh`, the commits after the one that installed it) shows
+  what the patch did.
+- Compare the Taskfile's anchor keys, vars and tasks with the block's by name,
+  plus those the applied entries say a release dropped. A `tf:*` task the
+  block does not define is an extra, unless `docs/tf-stack.md`'s
+  **Migration** section lists it as a CI shim.
+- Run the "Replaces" greps of **every** entry in `releases.md`, not only the
+  applied ones: a one-off can be added after the install. A hit inside the
+  shipped block is the block, not a one-off.
+- Grep CI (the files INSTALL step 3 lists) for each one-off's name.
+
+**U4. Require a clean tree** for every file U5 will touch: the scripts, the
+Taskfile, `.gitignore`, `docs/tf-stack.md`, and each file a one-off lives in.
+`git status` must show none of them modified or untracked; git is the only
+record of what the update overwrites, and it stands in for MIGRATE's tracked
+backup. Otherwise stop, name the files, and ask the user to commit or stash
+them. Never write over uncommitted changes, even when they look unrelated.
+
+**U5. Apply per the table.**
+
+- Copy both scripts as INSTALL step 5 does.
+- Rebuild the block from the asset (from `# ---- BEGIN SPLICE ----`) with the
+  CONDITIONAL sections the install kept; fill each repo-owned value from the
+  Taskfile as it stands rather than asking (a renamed one under its new name);
+  put back the `aliases:` the install added. Replace the old block's anchor,
+  `env:` keys, vars and tasks with it where they stand, leaving every other key
+  and task.
+- Merge the `.gitignore` lines INSTALL step 10 lists, each guarded by
+  `grep -qxF`.
+- Regenerate `docs/tf-stack.md` as INSTALL step 10 does, keeping its appended
+  **Migration** section.
+- Retire each one-off as its release entry says: remove it and put in its
+  replacement. One that CI calls is the exception: ask first (retire it and
+  rewrite the CI call now, or keep it and report it as pending), since removing
+  it breaks CI until the replacement works there — for `dev-secrets`, until the
+  per-variable secrets exist.
+- Never loosen a gate: nothing that stays loses its `:ask`/`:deny` suffix, and
+  every shim keeps its permission rule (convention 8). Removing a retired
+  one-off loosens nothing.
+
+**U6. Verify offline:** `task tf:verify` (all checks that need no network;
+name any skipped), `task tf:vars` and `task tf:backend` for each map id,
+`task tf:stacks:list`, `task tf:secrets:assert`, and `task tf:fmt:check` /
+`task tf:validate:local` where stacks exist. Extras must still resolve against
+the new var chain; grep for `__DEV_TF_` and fix any survivor.
+
+**U7. Report:** release from → to; local edits to toolkit-owned files that
+were overwritten (a script patch as U3 found it, the rest summarised from
+`git diff`); one-offs retired, any kept at the user's word, and any behaviour
+the shipped version lacks; extras kept and whether they still work; the
+post-update steps from each applied release's entry (what the user runs
+themselves); `task tf:verify` PASS/FAIL; then the caveats below that an
+applied release introduced. Leave the changes uncommitted for review.
+
+## Installing (INSTALL): steps 2–11
+
+### 2. Detect both INSTALL axes
 
 Compute both signals from the tables above before writing anything.
 
@@ -291,47 +412,25 @@ found, before step 3.
 >= 1.11 or Terraform >= 1.10, and `tf:secrets:new:ask` declares its variables
 `sensitive = true` **and** `ephemeral = true` without checking either the
 toolchain or the stack's `required_version`. Read the toolchain off the repo:
-`tofu version` for tofu (offline); for terraform the `TF_VERSION` var,
-`.terraform-version` or the `required_version` in the stack, since `terraform
-version` phones home. Record whether the toolchain clears the floor and what
-each stack's `required_version` allows (the greenfield `assets/stack/versions.tf`
-ships `>= 1.7.0`, deliberately: a stack with no secrets runs on older tofu).
-Below the floor, secrets still work with variables declared `sensitive = true`
-alone, by hand, which leaves the value in state and plan files; say so in
-step 11 rather than raising anyone's `required_version` unasked.
+`tofu version` (offline), or for terraform the `TF_VERSION` var,
+`.terraform-version` or the stack's `required_version`, since `terraform
+version` phones home. Record whether it clears the floor and what each stack's
+`required_version` allows (greenfield `assets/stack/versions.tf` ships `>=
+1.7.0`, deliberately: a stack with no secrets runs on older tofu). Below the floor, secrets still work with variables
+declared `sensitive = true` alone, by hand, which leaves the value in state and
+plan files; say so in step 11 rather than raising anyone's `required_version`.
 
 **Both Taskfile spellings count.** `Taskfile.yml` and `Taskfile.yaml` are
-equally valid to go-task; read "the Taskfile" everywhere below as whichever
-one this repo has. Taking the literal `.yml` reading on a `.yaml` repo detects
-`tf-new`, "writes freely", and leaves a second Taskfile shadowing the real one.
+equally valid to go-task; read "the Taskfile" below as whichever this repo has,
+or a `.yaml` repo reads as `tf-new` and gains a second, shadowing Taskfile.
 
 **The `tf-replace` signal is behaviour, not namespace.** A repo whose
-terraform tasks are named `init`, `plan`, `apply`, `otel-plan` is
-`tf-replace`, not `tf-add` — grep the Taskfile for `terraform`/`tofu`
-invocations rather than for a `tf:` prefix. Reading it as `tf-add` installs a
-complete second terraform surface beside the first. Where legacy un-namespaced
-names survive, report the overlap explicitly in step 11, and check whether
-`.claude/settings.local.json` already allowlists them (`Bash(task plan)`,
-`Bash(task apply)`) — those are ungated names that convention 8 assumes do not
-exist.
-
-**Already-installed short-circuit.** If the mode is `tf-refresh` and
-`scripts/tf-stack.sh` matches this skill's asset byte-for-byte, no
-`__DEV_TF_*__` token survives, and `task tf:verify` passes, then the install is
-current: report that and stop. Steps 3–10 all read as though work remains, and
-for a re-run — which is the common case — none does.
-
-**`tf-refresh` is detected by the ABI, not by a marker in the file.**
-`scripts/tf-stack.sh` exists **and** `bash scripts/tf-stack.sh help` lists the
-31 core names (the ABI before secrets; every release carries them, and a
-current install lists them among its 62) → a prior install. If the 31 secrets
-names are missing it predates secret management: that is a refresh, and
-`tf:verify` check 2 (which expects all 62) fails until it lands. A script of
-that name whose `help` lists none of the core names is someone's own; never
-overwrite it silently — ask. `$ARGUMENTS` `greenfield`/`update` forces the
-Taskfile axis only; the shape axis is always detected regardless of args.
-Announce the resolved pair (each axis, and whether it was detected or forced)
-before step 3.
+terraform tasks are named `init`, `plan`, `apply`, `otel-plan` is `tf-replace`,
+not `tf-add`: grep the Taskfile for `terraform`/`tofu` invocations, not for a
+`tf:` prefix, or a complete second terraform surface is installed beside the
+first. Report surviving legacy un-namespaced names in step 11, and check
+whether `.claude/settings.local.json` already allowlists them (`Bash(task
+plan)`): ungated names that convention 8 assumes do not exist.
 
 ### 3. Freeze the CI interface (`tf-add`/`tf-replace` only)
 
@@ -346,21 +445,21 @@ This step's `task <name>` freeze is; the sweep for `-chdir=`, `-var-file=`,
 obligation of **any run that moves a directory**, including a `tf-new` repo
 whose CI drives tofu directly and calls no task at all. Every such hit is a
 rewrite obligation shipping in the same commit as the `git mv` — see step 8.
-Present the count with the layout plan; it is usually the real cost of a move. If no CI config lives in this repo, say so, ask the user, and fall
-back to `references/migration.md` §1's shape **only as a labelled
-assumption**. Everything not on the list is explicitly allowed to break —
-state that back to the user; it is what makes step 10's remove-then-replace
-affordable.
+Present the count with the layout plan; it is usually the real cost of a move.
+If no CI config lives in this repo, say so, ask the user, and fall back to
+`references/migration.md` §1's shape **only as a labelled assumption**.
+Everything not on the list is explicitly allowed to break — state that back to
+the user; it is what makes step 10's remove-then-replace affordable.
 
 ### 4. Back up the Taskfile (`tf-add`/`tf-replace` only)
 
-`cp <taskfile> <taskfile>.bckp` (the spelling the repo actually uses), `git add` it, and verify with `git
-check-ignore -q <taskfile>.bckp` (must fail) and `git ls-files
+`cp <taskfile> <taskfile>.bckp` (the spelling the repo uses), `git add` it, and
+verify with `git check-ignore -q <taskfile>.bckp` (must fail) and `git ls-files
 --error-unmatch <taskfile>.bckp` (must succeed) — a gitignored backup cannot
 satisfy `references/migration.md` §5's "commit the backup, remove it after a
-stabilization period." An existing `.bckp` belongs to an earlier migration: ask before
-replacing it. Record the backup path and the removal criterion (one green CI
-run on every frozen name) for step 10's migration note.
+stabilization period." An existing `.bckp` belongs to an earlier migration: ask
+before replacing it. Record the backup path and the removal criterion (one green
+CI run on every frozen name) for step 10's migration note.
 
 ### 5. Copy the artifacts in
 
@@ -412,24 +511,21 @@ that it must be installed and authenticated; if it is missing, install anyway
 and say `tf:setup` will refuse until it is present.
 
 **Any other type**: omit that block, leave those three values empty, and say
-in the report that the state bucket or container is provisioned out of band.
-Nothing else changes — every other `tf:*` task is backend-agnostic, because
-`init` only ever passes `-backend-config=<file>` through, or nothing at all
-for a stack whose backend is inline.
+in the report that the state store is provisioned out of band. Nothing else
+changes: every other `tf:*` task is backend-agnostic, because `init` only
+passes `-backend-config=<file>` through, or nothing for an inline backend.
 
-**Secrets are GCP Secret Manager whatever the state backend is.**
-`tf:secrets:setup`, `:new`, `:pull:ask`, `:push:ask` and the report `tf:secrets`
-drive `gcloud` against `SECRETS_PROJECT`, so the report notes that `gcloud`
-must be installed and authenticated for them (the same caveat as `tf:setup`).
-`tf:secrets:assert` is offline and stays in every repo, because the plan,
-apply, refresh and destroy tasks call it; with no secret declared it passes.
-A repo that does not use GCP drops the five gcloud tasks and keeps the guard.
+**Secrets are GCP Secret Manager whatever the state backend is.** The
+`tf:secrets` report and `:setup`, `:new`, `:pull:ask`, `:push:ask` drive
+`gcloud` against `SECRETS_PROJECT`, so the report notes it must be installed and
+authenticated. `tf:secrets:assert` is offline and stays in every repo, because
+plan, apply, refresh and destroy call it; with no secret declared it passes. A
+repo not using GCP drops the five gcloud tasks and keeps the guard.
 
 **Greenfield writes the type into the stack too.** `assets/stack/backend.tf`
-ships its `backend "<type>" {}` block with a `__DEV_TF_*__` placeholder in the
-type slot, so the copy step 5 made at `<STACKS_DIR>/<name>/backend.tf` does not
-parse until the detected type is written in. Nothing else catches it:
-`tf:verify` check 4 scans the Taskfile, `scripts/` and `docs/`, never
+ships a `__DEV_TF_*__` placeholder in its `backend "<type>" {}` type slot, so
+the copy at `<STACKS_DIR>/<name>/backend.tf` does not parse until the detected
+type is written in. Nothing else catches it: `tf:verify` check 4 never scans
 `STACKS_DIR`.
 
 ### 8. Settle placement and extraction, per root module
@@ -495,10 +591,10 @@ into `variables/<id>.backend.hcl` unchanged, reduce the block to
 `backend "<type>" {}`, and ask before rewriting any `.tf`.
 
 `shape-single` and `shape-multi-stack` **keep their inline backends exactly as
-they are.** tf-stack reads an inline backend directly: `BACKEND` resolves to
-the `.tf`, `init` runs without `-backend-config`, and `tf:stacks:list` /
-`tf:backend` read the state location out of the block. Rewriting those `.tf`
-files buys nothing and touches state configuration for no reason.
+they are.** tf-stack reads an inline backend directly (`BACKEND` resolves to the
+`.tf`, `init` runs without `-backend-config`, `tf:stacks:list` and `tf:backend`
+read the state location out of the block), so rewriting those `.tf` files
+touches state configuration for no reason.
 
 `shape-workspaces`: **stop**. Explain the one safe conversion (a
 `BACKEND_MAP` id per workspace whose `backend.hcl` prefix points at the
@@ -518,11 +614,9 @@ dev:variables/common.tfvars,variables/dev.tfvars
 prod:variables/common.tfvars,variables/prod.tfvars
 ```
 
-It looks like YAML and is not: the parser is `cut -d: -f2-`, and
-`_normalize_spec` absorbs whitespace around the first colon and each comma
-before it gets there. What still matters is **order**: written order is
-precedence order, because tofu lets the last `-var-file` win. Confirm with
-`task tf:vars:ids`, then `task tf:vars STACK=<s> VARS=<id>`, before moving on.
+What matters is **order**: written order is precedence order, because tofu lets
+the last `-var-file` win. Confirm with `task tf:vars:ids`, then `task tf:vars
+STACK=<s> VARS=<id>`, before moving on.
 
 For each stack, list `variables/*.tfvars` and `variables/*.backend.hcl`.
 Detect a shared base (`common`/`base`/`shared`/`global`) and put it **first**;
@@ -532,9 +626,9 @@ alphabetically.
 
 Backend ids come from `variables/*.backend.hcl` basenames. **A stack whose
 backend is inline needs no `BACKEND_MAP` entry** — `BACKEND_DEFAULT` finds the
-`.tf` itself and names the id after the resolved `VARS_ID`. Add an entry only to pin it
-(`<id>:main.tf`), and note that an id spelled into `BACKEND_MAP` is resolved
-by path, so a `.tfbackend` or a path outside `variables/` works as written.
+`.tf` itself and names the id after the resolved `VARS_ID`. Add an entry only to
+pin it (`<id>:main.tf`); an id spelled into `BACKEND_MAP` is resolved by path,
+so a `.tfbackend` or a path outside `variables/` works as written.
 
 Two rules decide the `variables/<stack>.tfvars` question:
 
@@ -551,25 +645,22 @@ agree, or namespace them (`app_dev`, `data_dev`) where they don't; the `:all`
 tasks skip ids a stack has no backend config for.
 
 **Never write a `*.secret.tfvars` into a `VARS_MAP` line.** `VAR_FILES` appends
-the current `variables/<vars_id>.secret.tfvars` itself, last and once, and never
-loads one through a glob. A repo that already lists one (by hand, or from the
-older `dev-secrets` skill) needs it taken out first: `references/migration.md`
-§6 says why and how. Grep the existing maps and `variables/` for it before
-writing the new ones.
+the current `variables/<vars_id>.secret.tfvars` itself, last and once. Grep the
+existing maps and `variables/` for one first; `references/migration.md` §6 says
+how to take it out.
 
 Flag every file tofu auto-loads independently of `-var-file`, because
 `task tf:vars` will not show it and the values still reach the plan:
 `terraform.tfvars`, `terraform.tfvars.json`, and any `*.auto.tfvars` /
 `*.auto.tfvars.json` at the module root.
 
-`terraform.tfvars` is the one to look for hardest — it is the commonest tfvars
-name at a module root, and it interacts with step 8's tfvars move. **Do not
-move it silently.** Moving it into `variables/` stops the auto-load, so any
-frozen CI step running `tofu -chdir=<stack> plan` with no `-var-file` loses
-every value in it; leaving it means `task tf:vars` reports a var set that is
-not the one applied. Present both options and let the user choose; if it
-stays, say so in step 11 and add it to the front of that stack's `VARS_MAP`
-entry so the two paths agree.
+`terraform.tfvars` is the one to look for hardest, and it interacts with step
+8's tfvars move. **Do not move it silently.** Moving it into `variables/` stops
+the auto-load, so a frozen CI step running `tofu -chdir=<stack> plan` with no
+`-var-file` loses every value in it; leaving it means `task tf:vars` reports a
+var set that is not the one applied. Present both options; if it stays, say so
+in step 11 and add it to the front of that stack's `VARS_MAP` entry so the two
+paths agree.
 
 Present both maps for confirmation whenever there are more than two ids: this
 is the one step that infers rather than copies.
@@ -578,15 +669,7 @@ is the one step that infers rather than copies.
 
 `tf-replace`: delete **every** legacy `tf:*` task and legacy tf var in one
 edit, then write the new block in the next — never merge a legacy var into
-the new chain. `tf-add`: insert, preserving everything. `tf-refresh`: diff and
-apply only differences; present anything ambiguous instead of changing it.
-An install that predates secrets lacks six `vars:` entries, seven anchor keys,
-the six `tf:secrets:*` tasks, the `VAR_FILES` third argument, the
-`tf:secrets:assert` lines in `tf:plan`, `tf:plan:debug`, `tf:apply:ask`,
-`tf:refresh:ask` and `tf:destroy:deny`, and the `{{.VAR_FILES}}` in
-`tf:apply:ask`; all of it is in that diff. Check the repo's `VARS_MAP` for a
-hand-wired `*.secret.tfvars` first (`references/migration.md` §6): an entry for
-the current file is skipped everywhere, but any other one it names stops loading.
+the new chain. `tf-add`: insert, preserving everything.
 
 For each frozen CI name the new surface lacks: a **read-only name** (`tf:init`,
 `tf:validate`, `tf:fmt`) gets an `aliases:` entry on the canonical task; a
@@ -607,30 +690,28 @@ shim without a rule silently restores an ungated apply.
       - env -u TF_DATA_DIR task tf:apply:ask STACK=<s> VARS=<id>
 ```
 
-A call-scoped `vars:` block propagates **one level only**. `tf:apply:ask`
-opens with four nested `- task:` guard calls, so the structured form gives
-`tf:apply:ask` the right `STACK` and then hands `tf:stack:assert`,
-`tf:toolchain:assert:tofu`, `tf:vars:assert` and `tf:init:once` an **empty**
-one: the guards validate the default stack, `tf:init:once` initialises the
-default stack's backend, and the apply runs anyway. A selector passed on a
-command line is a global, so it reaches every depth. `env -u TF_DATA_DIR` for
-the same reason the `:all` loops carry it — `DATA_DIR` must be recomputed from
-the shim's own `BACKEND_ID`, not inherited. `set-env-<env>` maps to one
-ungated wrapper per env running `task tf:use STACK=<s> VARS=<env>`.
+A call-scoped `vars:` block propagates **one level only**: `tf:apply:ask` opens
+with four nested `- task:` guard calls, so the structured form hands
+`tf:stack:assert`, `tf:toolchain:assert:tofu`, `tf:vars:assert` and
+`tf:init:once` an **empty** `STACK` — the guards validate the default stack and
+the apply runs anyway. A selector on a command line is a global and reaches
+every depth. `env -u TF_DATA_DIR` for the same reason the `:all` loops carry
+it: `DATA_DIR` must be recomputed from the shim's own `BACKEND_ID`.
+`set-env-<env>` maps to one ungated wrapper per env running `task tf:use
+STACK=<s> VARS=<env>`.
 
 Merge `.gitignore` (each guarded by `grep -qxF`): `<TMP>/`, `.terraform*/`,
 `.terraform.lock.hcl`, `*.env`, `*.tfplan`, `*.secret.tfvars`, `/secrets/`
-(the last two are also appended by `tf:secrets:setup` and `tf:secrets:pull:ask`,
-and committed here so a fresh clone is safe before anyone runs them; `/secrets/`
-is `/<SECRETS_DIR>/`, the repo's one home of file secrets, anchored to the root
-so a module directory called `secrets/` is not ignored. Write the line for the
-`SECRETS_DIR` in effect, and a repo whose `dev-secrets`
-`secrets/manifest.txt` is tracked has to resolve that first, §6 step 4); confirm `<taskfile>.bckp` is
-**not** matched. Merge `.claude/settings.local.json`: `Bash(task *:ask)` /
-`Bash(task *:deny)` (delegate to `/dev-tasks` step 5 if absent) plus the shim
-rules; **write no raw `Bash(tofu…)`/`Bash(terraform…)`/`Bash(gcloud…)`
-allow**, and if one already exists, surface it as the run's most important
-finding.
+(the last two are also appended by `tf:secrets:setup` and `:pull:ask`; committed
+here so a fresh clone is safe before anyone runs them. `/secrets/` is
+`/<SECRETS_DIR>/` for the `SECRETS_DIR` in effect, anchored to the root so a
+module directory called `secrets/` is not ignored; a tracked `dev-secrets` `secrets/manifest.txt` has
+to be resolved first, `references/migration.md` §6 step 4); confirm
+`<taskfile>.bckp` is **not** matched. Merge `.claude/settings.local.json`:
+`Bash(task *:ask)` / `Bash(task *:deny)` (delegate to `/dev-tasks` step 5 if
+absent) plus the shim rules; **write no raw `Bash(tofu…)`/`Bash(terraform…)`/
+`Bash(gcloud…)` allow**, and if one already exists, surface it as the run's
+most important finding.
 
 Copy `references/tf-stack.md` → `docs/tf-stack.md`, re-pointing examples at
 this repo's stacks and dropping inapplicable shape sections; append a
@@ -641,27 +722,26 @@ not a chat message.
 
 ### 11. Report
 
-Summarize: mode pair resolved (each axis, detected vs. forced, and the
-signal); artifacts installed; backup committed and CI
-names frozen (confirmed from workflow files vs. taken on the user's word); the
-eight values set (detected vs. asked vs. defaulted); `VARS_MAP`/`BACKEND_MAP` as
-written, per id, with the files each resolves to (and, for a single-env repo,
-that both are deliberately empty); the backend type detected, whether the
-`tf:setup` block was emitted or omitted, and for gcs whether `gcloud` is
-present; layout decision (`STACKS_DIR` value, already conventional vs.
-pointed at an existing dir vs. migrated via `git mv` vs. stopped on
-workspaces); legacy tasks removed, kept, or shimmed, each shim with its
-permission rule; `task tf:verify` PASS/FAIL lines with any check
-skipped for lack of network named explicitly; and the toolchain
-against the ephemeral floor (tofu >= 1.11 / terraform >= 1.10) and what each
-stack's `required_version` allows; the `SECRETS_PROJECT` in effect; the first
-commands for the user to run themselves (`task tf:setup:all STACK=…`, then
-`task tf:plan STACK=… VARS=…`) and, for secrets, `task tf:secrets:setup` once,
-then `task tf:secrets:new:ask STACK=… VARS=… ID=<var>` per secret (`tf:secrets:new:ask`
-is `:ask`-gated like push and pull, so it stops for confirmation; it needs `gcloud`, `roles/secretmanager.admin` on the project, a toolchain at or
-above the floor, and a stack whose `required_version` allows `ephemeral`; a
-clone that only plans needs `tf:secrets:pull:ask` and
-`roles/secretmanager.secretAccessor`). End with the caveats below.
+Summarize: GREENFIELD or MIGRATE, and the mode pair behind it (each axis,
+detected vs. forced, and the signal); artifacts installed; backup committed and CI names frozen (confirmed
+from workflow files vs. taken on the user's word); the eight values set
+(detected vs. asked vs. defaulted); `VARS_MAP`/`BACKEND_MAP` as written, per id,
+with the files each resolves to (and, for a single-env repo, that both are
+deliberately empty); the backend type detected, whether the `tf:setup` block
+was emitted or omitted, and for gcs whether `gcloud` is present; layout
+decision (`STACKS_DIR` value, already conventional vs. pointed at an existing
+dir vs. migrated via `git mv` vs. stopped on workspaces); legacy tasks removed,
+kept, or shimmed, each shim with its permission rule; `task tf:verify` PASS/FAIL
+lines with any check skipped for lack of network named explicitly; the
+toolchain against the ephemeral floor (tofu >= 1.11 / terraform >= 1.10) and
+what each stack's `required_version` allows; the `SECRETS_PROJECT` in effect;
+the first commands for the user to run themselves (`task tf:setup:all
+STACK=…`, then `task tf:plan STACK=… VARS=…`) and, for secrets, `task
+tf:secrets:setup` once, then `task tf:secrets:new:ask STACK=… VARS=… ID=<var>`
+per secret (needs `gcloud`, `roles/secretmanager.admin`, a toolchain at or above
+the floor and a `required_version` that allows `ephemeral`; a clone that only
+plans needs `tf:secrets:pull:ask` and `roles/secretmanager.secretAccessor`). End
+with the caveats below.
 
 ---
 
@@ -680,17 +760,16 @@ clone that only plans needs `tf:secrets:pull:ask` and
   before planning.
 - **`tf:secrets:assert` is a guard, not a fetch.** It fails when a required
   secret is not on the machine and never calls the cloud; `tf:secrets:pull:ask`
-  is the fix it names. `tf:secrets:new:ask` creates a cloud secret, so like
-  `pull:ask` and `push:ask` it is gated by the `Bash(task *:ask)` rule.
+  is the fix it names. `tf:secrets:new:ask` is gated by `Bash(task *:ask)` like
+  `pull:ask` and `push:ask`.
 - **File secrets share one directory.** `SECRETS_DIR` (default `secrets`) is
   relative to the repo root, one per repo; a bare `file = "sa.json"` lands in
   `<SECRETS_DIR>/<stack>/<vars_id>/`, and the variable holds the path from the
   stack directory (`../../secrets/app/dev/sa.json`). It is git-ignored as
   `/<SECRETS_DIR>/`; an empty, absolute or `..` value is refused.
-- **Ephemeral has a cost.** The value may feed only providers, write-only
-  (`*_wo`) arguments and the like, never a regular resource argument; the
-  fix is to drop `ephemeral = true` by hand and accept the value in state.
-  `references/tf-stack.md` ("Ephemeral by default") has the detail.
+- **Ephemeral has a cost.** The value may feed only providers and write-only
+  (`*_wo`) arguments; otherwise drop `ephemeral = true` by hand and accept the
+  value in state (`references/tf-stack.md`, "Ephemeral by default").
 - **`VARS=id:glob` bypasses the map entirely.** An explicit glob on the CLI
   skips `VARS_MAP` lookup and its ordering guarantees — useful for one-off
   debugging, risky as a habit.
@@ -698,8 +777,8 @@ clone that only plans needs `tf:secrets:pull:ask` and
   `tf:init:once:all`, and `tf:setup:all` deliberately carry no env anchor and
   keep `env -u TF_DATA_DIR` on their nested calls; do not "clean up" that
   asymmetry.
-- **`tf:use` gitignores `*.env`, not `<stack>.env`.** Any dotfile matching
-  `*.env` in the repo root is covered by the same gitignore line; that is
+- **`tf:use` gitignores `*.env`, not `<stack>.env`.** Any file ending `.env`,
+  anywhere in the repo, is covered by the same gitignore line; that is
   intentional, not a narrower per-stack rule.
 - **`task tf:validate:all` can pass while validating nothing.** An empty
   `STACKS_DIR` (default `stacks/`) makes it a zero-iteration success — check

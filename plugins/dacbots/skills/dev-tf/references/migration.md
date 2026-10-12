@@ -1,11 +1,13 @@
-# Migrating an existing Taskfile
+# Migrating an existing Taskfile (MIGRATE)
 
-This applies whenever `Taskfile.yml` already has tasks that invoke
-`terraform`/`tofu`, under any name (mode `tf-replace`), or already has
-other tasks but none that do (mode `tf-add`). The goal: replace
-whatever tf tooling exists today with the full tf-stack surface,
-without breaking anything CI actually calls, and without moving any
-stack's state.
+This is the MIGRATE path of `/dev-tf`'s INSTALL mode; updating a repo that
+already has a dev-tf install is UPDATE, which does not follow it and reads
+only §6 (see `references/releases.md`). It applies whenever `Taskfile.yml`
+already has tasks that invoke `terraform`/`tofu`, under any name (mode
+`tf-replace`), or already has other tasks but none that do (mode `tf-add`). The
+goal: replace whatever tf tooling exists today with the full tf-stack surface,
+without breaking anything CI actually calls, and without moving any stack's
+state.
 
 ## 1. Discover the CI interface
 
@@ -55,7 +57,7 @@ nothing about what a wrapper task's `cmds:` actually run.
 | `tf:init` | `tf:init:once` | `aliases:` on the canonical task | none — read-only |
 | `tf:validate` | `tf:validate` | already the canonical name | none |
 | `tf:fmt` | `tf:fmt` | already the canonical name | none |
-| `tf:apply` | `tf:apply:ask` | visible wrapper task, `desc: 'CI compat shim for tf:apply:ask -- remove after stabilization'`, `cmds: [{task: tf:apply:ask}]` | `Bash(task tf:apply)` in `permissions.ask` |
+| `tf:apply` | `tf:apply:ask` | visible wrapper task, `desc: 'CI compat shim for tf:apply:ask -- remove after stabilization'`, one shell command line `env -u TF_DATA_DIR task tf:apply:ask STACK=<s> VARS=<id>` (never `cmds: [{task: …, vars: …}]`, whose vars do not reach the guards; SKILL.md step 10) | `Bash(task tf:apply)` in `permissions.ask` |
 | `tf:destroy` | `tf:destroy:deny` | visible wrapper task, same shape, worded for destroy | `Bash(task tf:destroy)` in `permissions.deny` |
 | `set-env-<env>` | `tf:use STACK=<s> VARS=<env>` | one ungated wrapper task per env running that command | none — writes only a local, gitignored `<stack>.env` file |
 
@@ -204,6 +206,11 @@ by restoring the Taskfile either; decide separately whether they should
 stay.
 
 ## 6. Secrets: a repo that already wires `*.secret.tfvars`
+
+MIGRATE reads this section before installing. UPDATE reads it for release
+0.7.0's one-offs and does not choose in step 4: the release wins over a local
+one-off, so it takes the last option and retires `secrets:upload`/`:download`
+(`references/releases.md`, 0.7.0).
 
 `tf:secrets:*` is the toolkit's own secret management (see
 `references/tf-stack.md`, "Secrets"): a `variable` with `sensitive = true`

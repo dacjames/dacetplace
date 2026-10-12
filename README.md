@@ -48,9 +48,9 @@ force a ruleset.
 
 /dev-codify                   # route an inline throwaway script to a durable home
 
-/dev-tf                       # detect toolchain/backend/mode, install tf:* tasks
-/dev-tf s3                    # force the s3 backend
-/dev-tf update                # force the harmonize (update) path
+/dev-tf                       # detect: update an existing install, or install fresh
+/dev-tf update                # update an existing dev-tf install to this release
+/dev-tf migrate               # first install over a hand-rolled terraform Taskfile
 ```
 
 ## Plugins
@@ -65,4 +65,4 @@ Secure dev-tool permission setup and project scaffolding skills.
 | `dev-tasks` | Scaffolds a convention-compliant go-task `Taskfile.yml`: idempotent, `:`-nested, quiet-by-default, `CLI_ARGS` passthrough, local temp dir, `:ask`/`:deny`-suffixed tasks gated by permission rules. Detects toolchain or takes args (`go`, `tf`, `py`, `node`). |
 | `dev-secrets` | Wires `secrets:upload` / `secrets:download` tasks (GCP Secret Manager) into the repo's task runner — adapts the `:`-naming to go-task/make/npm/shell. Committed name-manifest, gitignored values. Optional GitHub Actions download step and `*.secret.tfvars` terraform support (per-env, gitignored, round-tripped). Detects backend/runner or takes args (`gcp`, `task`, `make`, `npm`, `shell`). |
 | `dev-codify` | Routes an inline throwaway script (`bash -c`, `python -c`, `node -e`, a heredoc) to a durable home instead of running and discarding it — an existing script/task first, then a new Taskfile task or script file. No args. |
-| `dev-tf` | Replicates the tf-stack terraform/opentofu toolkit — `scripts/tf-stack.sh`, the `tf:*` namespace, the `stacks/<name>/variables/` layout. Selection by name (`VARS=dev`, `BACKEND=prod`), guards before tofu runs, collision-free `TF_DATA_DIR` and plan files. Detects greenfield vs. update; on update backs up the Taskfile and freezes CI-called names behind gated compat shims. Secrets via `tf:secrets:*`: one GCP Secret Manager secret per `sensitive`/`ephemeral` variable, pulled into a gitignored `<vars_id>.secret.tfvars`. GCS and local provisioning implemented; s3/azurerm documented. Args: `greenfield`/`update`, a backend (`gcs`, `s3`, `azurerm`, `local`), a toolchain. |
+| `dev-tf` | Replicates the tf-stack terraform/opentofu toolkit — `scripts/tf-stack.sh`, the `tf:*` namespace, the `stacks/<name>/variables/` layout. Selection by name (`VARS=dev`, `BACKEND=prod`), guards before tofu runs, collision-free `TF_DATA_DIR` and plan files. Two modes: UPDATE brings an existing install to the current release (the release wins over older features and local one-offs; repo settings are kept; per-release notes in `references/releases.md`), and INSTALL sets up a repo for the first time, either greenfield or by migrating a hand-rolled terraform Taskfile (backs it up and freezes CI-called names behind gated compat shims). Secrets via `tf:secrets:*`: one GCP Secret Manager secret per `sensitive`/`ephemeral` variable, pulled into a gitignored `<vars_id>.secret.tfvars`. GCS and local provisioning implemented; s3/azurerm documented. Args: `update`/`migrate`/`greenfield`, a toolchain (`tofu`, `terraform`); the backend is read from the repo. |
