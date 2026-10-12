@@ -298,7 +298,11 @@ there are load-bearing:
 
 Per-environment loops: `tf:setup:all` (one bucket per backend),
 `tf:init:once:all`, `tf:plan:all` (one plan per name in `VARS_MAP`, each
-against its own state).
+against its own state). Each iteration is its own `task` run through
+`scripts/tf-stack.sh task`, which works out the stack, vars and data dir
+afresh and passes on the run-wide selectors, so `task tf:plan:all
+STACK=multi-env TF=terraform NO_LOCK=true` holds for every environment. The
+forwarded names are `TASK_FORWARD` in the script.
 
 ### Multi-stack multi-env
 
@@ -619,6 +623,177 @@ whether you are behind:
 | `SECRET_TFVARS` | `variables/<vars_id>.secret.tfvars` | What pull writes, stack-relative |
 | `SECRETS_TF` | `secrets.tf` | Where `tf:secrets:new:ask` declares variables, stack-relative |
 
+## Seeds
+
+A **seed** is the small part of a stack that creates the values other stacks need (an OAuth
+client, a table of allocated ids), lifted into a module of its own and published through the
+maker's state. Users read the seed instead of depending on the whole maker, so the makers
+can be applied first, only for their seeds, and then every stack deployed at once. The
+channel is the maker's Terraform state (`terraform_remote_state`); nothing else is built
+yet.
+
+Only **stateful** values become seeds: anything state has to remember, whether a cloud resource
+or a calculation such as a random id or a CIDR allocation. A **stateless** value, one that is
+a function of its inputs alone, is an ordinary module in `modules/` that every stack needing
+it calls for itself. Stacks never depend on each other directly, only on seeds.
+
+```
+stacks/portal/                  # the maker
+  main.tf  seeds.tf
+  seeds/oauth_client/
+    main.tf                     # the seed: its resources, one output per value
+    read/main.tf                # the reader: the same outputs, fed from portal's state
+stacks/web/main.tf              # a user: module "oauth" { source = "../portal/seeds/oauth_client/read" ... }
+```
+
+Three files, only the first by hand. The seed is an ordinary module; `seeds.tf` holds its call
+and one root output, `seed_<name>`, which is the whole seed as an object; the reader is plain
+Terraform that `task tf:seed:new` writes for you. Nothing is registered: the tasks find
+seeds by reading these `.tf` files.
+
+```hcl
+# stacks/portal/seeds/oauth_client/main.tf
+resource "google_iap_client" "this" { ... }
+
+output "client_id" { value = google_iap_client.this.client_id }
+output "client_secret" {
+  value     = google_iap_client.this.secret
+  sensitive = true
+}
+```
+
+```
+task tf:seed:new STACK=portal SEED=oauth_client     # reader + the call and output in seeds.tf
+task tf:init:init STACK=portal                      # the new module call needs an init
+```
+
+The scaffold is specialised to the maker's backend (`local` and `gcs` are supported, any
+other type is refused): it takes the state location from `variables/<maker>.backend.hcl`, or
+from the `.tf` holding the backend block when the stack keeps its backend inline. It also
+writes a **placeholder** for each output, `"placeholder-<name>"`. Replace them with
+well-formed values (the real one where it is known in advance, like a client id). The reader's
+outputs must keep the seed's names and `sensitive` flags; `task tf:seeds:check` compares them.
+
+### Using a seed
+
+From another stack, call the reader and name the maker's backend id:
+
+```hcl
+module "oauth" {
+  source = "../portal/seeds/oauth_client/read"
+  maker  = "standard"            # BACKEND id of the maker's run: portal's standard.backend.hcl
+}
+
+resource "google_cloud_run_v2_service" "web" {
+  # ... module.oauth.client_id, module.oauth.client_secret
+}
+```
+
+**Same stack, two instances.** `portal` runs as `VARS=standard` and `VARS=beta`; beta should reuse
+standard's client, not make its own. That is a hand-written toggle in the stack, with the
+variable true in the maker's tfvars:
+
+```hcl
+variable "oauth_client_maker" {
+  type    = bool
+  default = false                # true in standard.tfvars
+}
+
+module "oauth_client" {
+  source = "./seeds/oauth_client"
+  count  = var.oauth_client_maker ? 1 : 0
+}
+
+module "oauth_client_read" {
+  source = "./seeds/oauth_client/read"
+  count  = var.oauth_client_maker ? 0 : 1
+  maker  = "standard"
+}
+
+locals {
+  oauth_client = var.oauth_client_maker ? module.oauth_client[0] : module.oauth_client_read[0]
+}
+
+output "seed_oauth_client" {
+  value     = one(module.oauth_client)    # null where the seed is not made
+  sensitive = true
+}
+```
+
+The two branches have the same type because the reader's outputs mirror the seed's.
+
+### Placeholders and the guard
+
+Until the maker has applied the seed, its state has no value to read. The reader does not
+fail: it returns the placeholders, so a user can still be planned. A plan in that state
+shows them:
+
+```
+  + resource "terraform_data" "app" {
+      + input = { client_id = "placeholder-client_id", ... }
+```
+
+and any apply refuses. The reader also plans a `placeholder_guard` resource whose
+postcondition can never hold, so applying that plan fails and creates nothing that uses the seed:
+
+```
+Error: Resource postcondition failed
+  seed portal.oauth_client is a placeholder: its maker (stack portal, BACKEND=standard)
+  has not applied it. Seed first with task tf:seeds:apply:ask, then plan again.
+```
+
+Once the maker has applied the seed, planning the user again reads the real values and
+removes the guard.
+
+### Two phases
+
+```
+task tf:seeds:apply:ask        # 1. seed: every maker stack, in dependency order, only its seed calls
+task tf:deploy:plan            # 2. deploy: plan every stack...
+task tf:deploy:apply:ask       #    ...then apply every stack, four at a time (PARALLEL=n)
+```
+
+The seed phase is `tf:seed:plan` (a plan limited with `-target` to the stack's seed calls, saved
+beside the normal plan file as `*.seed.tfplan`) and `tf:seed:apply:ask` for each maker stack
+and `VARS` id, applied only when there are changes. `tf:seeds:plan` stops after the plans.
+tofu's warning that `-target` is in use is expected here. A stack goes after the stacks
+whose seeds it reads, which the tasks work out from the `.tf` files: a file under its `seeds/`
+that calls another stack's reader, or a seed call in its root that refers to one. A cycle is an
+error naming the stacks.
+
+The deploy phase initialises every stack and `VARS` id one at a time (the plugin cache is not
+safe under concurrent init), runs the plans or applies in parallel with a log per unit under
+`<TMP>/deploy/`, then prints every log in full followed by a summary, and exits 1 if
+any unit failed. An apply skips plan-only stacks. Run it before the seed phase and the makers
+apply while the users hit the guard: the failure is the point.
+
+### Checking
+
+```
+$ task tf:seeds:list
+STACK   SEED          CALL          OUTPUT             READERS
+portal  oauth_client  oauth_client  seed_oauth_client  portal:seeds.tf,web:main.tf
+$ task tf:seeds:check
+```
+
+`tf:seeds:check` exits 1 listing every problem: a seed with no call whose `source` is
+exactly `./seeds/<seed>`; no root output `seed_<seed>`; no `read/`; a reader whose outputs
+differ from the seed's in name or `sensitive`; a reader `source` that is the `read/` of no
+existing seed; a seed dependency cycle.
+
+### Limits (v1)
+
+- Only the `remote_state` channel; `gcs` and `secret_manager` channels are not built.
+- A `gcs` reader decides whether the maker has written its state by listing the bucket for
+  `<prefix>/default.tfstate`; that check has not been run against GCP.
+- A `local` reader treats an empty state file as absent, since a plan of the maker creates
+  one to take its lock.
+- Seeds are found one level down: `STACKS_DIR/<stack>/seeds/<seed>/`.
+- The reader mirrors the seed's outputs by hand; the check catches drift, nothing regenerates it.
+- Seed order is per stack; the `VARS` ids of one stack run in `VARS_MAP` order, so a seed
+  reading another `VARS` id of its own stack may need a second `tf:seeds:apply:ask` (the guard
+  keeps the first one safe). Ordering follows direct `module.<reader>` references only.
+
 ## Command reference
 
 `STACK`, `VARS`, `BACKEND` and `TF` apply to every `tf:*` task and are
@@ -733,6 +908,23 @@ resolve. `tf:output` and `tf:clean` are ungated.
 | `tf:destroy:deny` | `destroy` everything the stack manages |
 | `tf:output` | Print the stack's outputs |
 | `tf:clean` | Remove every toolchain's provider dir, the lock file and stash, and the temp dir |
+
+### `tf:seeds:*`, `tf:seed:*`, `tf:deploy:*` — seeds and the two phases
+
+The singular tasks take `STACK` and `VARS` like `tf:plan`; the plural ones cover the whole
+repo. See [Seeds](#seeds).
+
+| Task | What it does |
+| --- | --- |
+| `tf:seeds:list` | Every seed: stack, call, root output, and the `stack:file` of each reader |
+| `tf:seeds:check` | Lint every seed and the seed order; exit 1 on a problem |
+| `tf:seed:new` | `SEED=<name>`. Scaffold the reader, the seed stub if the seed is new, and the call and output in `seeds.tf`. Files only, so no `:ask` |
+| `tf:seed:plan` | Plan only the stack's seed calls (`-target`), saved as `<plan file>.seed.tfplan` |
+| `tf:seed:apply:ask` | Apply that saved seed plan |
+| `tf:seeds:plan` | `tf:seed:plan` for every maker stack and `VARS` id, in seed order |
+| `tf:seeds:apply:ask` | For each of those: plan, and apply when there are changes |
+| `tf:deploy:plan` | `tf:plan` for every stack and `VARS` id, `PARALLEL` (default 4) at a time, a log per unit in `<TMP>/deploy/` |
+| `tf:deploy:apply:ask` | `tf:apply:ask` for the same, plan-only stacks skipped |
 
 ## The guards
 

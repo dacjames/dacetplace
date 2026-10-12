@@ -58,7 +58,7 @@ script rather than inline `cmds`.
 
 Arguments: `$ARGUMENTS` — optional hints. Mode: `update` (update an existing
 install), `migrate` (the migration path of INSTALL; what `update` used to mean),
-`greenfield`. Toolchain: `tofu`, `terraform`. With no args, detect both from the
+`greenfield`; Modes says exactly what each does. Toolchain: `tofu`, `terraform`. With no args, detect both from the
 repo. The backend is never an argument — it is read off the repo's own backend
 configuration in step 2.
 
@@ -79,9 +79,11 @@ configuration in step 2.
 | `*.secret.tfvars`, `/secrets/` | `.gitignore` | two lines, each guarded by `grep -qxF` (step 10) |
 
 `assets/tf-stack.sh` is the upstream `scripts/tf-stack.sh` minus five
-functions specific to its home repo; the 62 that remain are the ABI: 31 core
-names (selection, guards, init, setup) and 31 that carry secret management
-(`SECRETS_DISCOVER`, `_hcl_blocks`, `tf_secrets*`, 23 `_secrets_*` helpers).
+functions specific to its home repo; the 89 that remain are the ABI: 31 core
+names (selection, guards, init, setup), 31 that carry secret management
+(`SECRETS_DISCOVER`, `_hcl_blocks`, `tf_secrets*`, 23 `_secrets_*` helpers),
+and 27 that carry seeds and the nested-call wrapper (`SEED_TARGETS`,
+`tf_seed*`, `tf_deploy_*`, the `_seeds_*`/`_deploy_*` helpers, and `task`).
 `bash scripts/tf-stack.sh help` lists them. Every release since 0.3.0 carries
 22 of them, which is how Modes tells a prior install, of any release, from a
 hand-written script of the same name.
@@ -90,11 +92,13 @@ hand-written script of the same name.
 
 ## What tf-stack is
 
-Three parts: the `tf:*` tasks with their variable chain (a misnamed var silently
-no-ops a task), `scripts/tf-stack.sh` (the 14 uppercase resolvers and every
-function a Taskfile `sh:` block calls by name), and one root module per stack
-under `STACKS_DIR` (two stacks sharing a data dir or plan file corrupt each
-other's plan/state silently).
+Three parts: the `tf:*` tasks with their variable chain, seeds and the
+two-phase deploy (`tf:seed*`, `tf:deploy:*`) among them (a misnamed var
+silently no-ops a task), `scripts/tf-stack.sh` (the 15 uppercase resolvers,
+every function a Taskfile `sh:` block calls by name, and `task`, the wrapper
+every nested task call goes through), and one root module per stack under
+`STACKS_DIR` (two stacks sharing a data dir or plan file corrupt each other's
+plan/state silently).
 
 | Selector | Picks | Source |
 |---|---|---|
@@ -120,7 +124,7 @@ Two modes, decided first, before any other detection:
 
 | Mode | Signal | What it does |
 |---|---|---|
-| UPDATE | `scripts/tf-stack.sh` defines all 22 **base names**, the ABI every release since 0.3.0 carries (listed in `references/releases.md`, 0.3.0); a current install defines 62 | brings the existing install up to the current release — see "Updating an install" |
+| UPDATE | `scripts/tf-stack.sh` defines all 22 **base names**, the ABI every release since 0.3.0 carries (listed in `references/releases.md`, 0.3.0); a current install defines 89 | brings the existing install up to the current release — see "Updating an install" |
 | INSTALL | everything else | puts the toolkit into a repo for the first time, on the two axes below; resolves to GREENFIELD or MIGRATE |
 
 Check by reading before running: Grep `scripts/tf-stack.sh` for the base
@@ -130,14 +134,29 @@ tofu. None → someone's own script; some → unclear: either way ask, and never
 overwrite it silently. Only a prior install is run (`bash scripts/tf-stack.sh
 help`, which prints to stderr and exits 1 by design).
 
-`$ARGUMENTS`: `update` on a repo with no prior install stops and says so,
-offering INSTALL and naming what it would resolve to (GREENFIELD or MIGRATE).
-`migrate` or `greenfield` on a repo with a prior install asks before going on,
-recommending UPDATE: MIGRATE would treat the installed `tf:*` block as legacy,
-back it up and re-derive every repo-owned value instead of carrying it.
-Otherwise `migrate`/`greenfield` force INSTALL's Taskfile axis only; the shape
-axis is always detected. Announce the resolved mode (and, for INSTALL, each
-axis and whether it was detected or forced) before writing anything.
+`$ARGUMENTS` pick a mode. They never change what detection found, and an
+argument can only add caution, never remove it:
+
+- `update` on a repo with no prior install stops and says so, offering
+  INSTALL and naming what it would resolve to (GREENFIELD or MIGRATE).
+- `migrate` or `greenfield` on a repo with a prior install asks before going
+  on, recommending UPDATE: MIGRATE would treat the installed `tf:*` block as
+  legacy, back it up and re-derive every repo-owned value instead of carrying
+  it.
+- `migrate` on INSTALL runs MIGRATE even where detection says GREENFIELD, and
+  reads a `tf-add` Taskfile as `tf-replace`: the user is saying terraform is
+  driven from somewhere the detection grep cannot see (a task calling a
+  wrapper script, make, terragrunt). Ask which tasks those are; they are the
+  legacy surface that steps 3 and 10 freeze and replace. `tf-new` and
+  `tf-replace` keep their detected value, and the shape axis is always
+  detected.
+- `greenfield` on INSTALL is a check, not an override. If detection says
+  GREENFIELD, go on. If it says MIGRATE, stop, name the signals that made it
+  so (the Taskfile's terraform tasks, the modules that need moving), and ask.
+  It never skips MIGRATE's backup, CI-name freeze or move confirmation.
+
+Announce the resolved mode, and for INSTALL each axis with its detected value
+and anything an argument changed, before writing anything.
 
 ### INSTALL: the two axes
 
@@ -192,16 +211,23 @@ Everything else is MIGRATE. Ambiguity → AskUserQuestion, never a guess.
 
 1. **Copy, never retype.** `cp` byte-for-byte; `tf-stack.sh` has no editable
    region, and nothing in it is meant to be adjusted per repo.
-2. **The variable chain is adopted whole.** All 43 `vars:` entries (the six secrets ones among them), all of them or none —
+2. **The variable chain is adopted whole.** All 46 `vars:` entries (the six secrets and three seeds ones among them), all of them or none —
    adopting the chain piecemeal is fragile: a var the anchor lacks reads as an
    empty string in the script.
-3. **Names are an ABI.** The 14 uppercase resolvers are called by exact string
+3. **Names are an ABI.** The 15 uppercase resolvers are called by exact string
    from `sh:` blocks and dispatched by `declare -F`; renaming one breaks
    variable evaluation for every task with an opaque `unknown command`.
-4. **Three loop tasks carry no env anchor.** `tf:plan:all`, `tf:init:once:all`,
-   and `tf:setup:all` skip `env: *tf_stack_env`, and every nested call inside
-   them keeps `env -u TF_DATA_DIR`. Both failures are silent-wrong-answer, not
-   errors.
+4. **Every nested task call goes through `scripts/tf-stack.sh task`.** A task
+   that runs `task` from its shell (the `:all` loops, the seeds and deploy
+   loops, a CI shim) must call `scripts/tf-stack.sh task …`, never bare
+   `task` or `env -u TF_DATA_DIR task`, and carries `env: *tf_stack_env` so
+   the wrapper has the `V_*` to read. go-task lets an inherited variable beat a
+   task's own `env:` block, so the wrapper clears every `V_*` and `TF_DATA_DIR`
+   for the child to recompute. A child process sees none of the caller's
+   command-line vars, so it passes the run-wide selectors in `TASK_FORWARD`
+   (`TF`, `NO_LOCK`, `STACKS_DIR`, …) on again. Both failures are
+   silent-wrong-answer, not errors: a prod iteration planning against dev's
+   data dir, or `TF=terraform` planning with tofu.
 5. **Guards before tofu.** The four `internal: true` guards ship even when
    `TF` is hardcoded; a glob matching nothing must be an error, because tofu
    happily plans from variable defaults instead.
@@ -686,8 +712,9 @@ shim without a rule silently restores an ungated apply.
 ```yaml
   tf:apply:
     desc: CI compat shim for tf:apply:ask (remove after stabilization)
+    env: *tf_stack_env
     cmds:
-      - env -u TF_DATA_DIR task tf:apply:ask STACK=<s> VARS=<id>
+      - scripts/tf-stack.sh task tf:apply:ask STACK=<s> VARS=<id>
 ```
 
 A call-scoped `vars:` block propagates **one level only**: `tf:apply:ask` opens
@@ -695,8 +722,9 @@ with four nested `- task:` guard calls, so the structured form hands
 `tf:stack:assert`, `tf:toolchain:assert:tofu`, `tf:vars:assert` and
 `tf:init:once` an **empty** `STACK` — the guards validate the default stack and
 the apply runs anyway. A selector on a command line is a global and reaches
-every depth. `env -u TF_DATA_DIR` for the same reason the `:all` loops carry
-it: `DATA_DIR` must be recomputed from the shim's own `BACKEND_ID`.
+every depth. `scripts/tf-stack.sh task` for the same reason the `:all` loops
+use it (convention 4): `DATA_DIR` must be recomputed from the shim's own
+`BACKEND_ID`, and a `TF=` given to the shim must reach the apply.
 `set-env-<env>` maps to one ungated wrapper per env running `task tf:use
 STACK=<s> VARS=<env>`.
 
@@ -722,8 +750,8 @@ not a chat message.
 
 ### 11. Report
 
-Summarize: GREENFIELD or MIGRATE, and the mode pair behind it (each axis,
-detected vs. forced, and the signal); artifacts installed; backup committed and CI names frozen (confirmed
+Summarize: GREENFIELD or MIGRATE, and the mode pair behind it (each axis, its
+detected value and signal, and anything an argument changed); artifacts installed; backup committed and CI names frozen (confirmed
 from workflow files vs. taken on the user's word); the eight values set
 (detected vs. asked vs. defaulted); `VARS_MAP`/`BACKEND_MAP` as written, per id,
 with the files each resolves to (and, for a single-env repo, that both are
@@ -773,10 +801,10 @@ with the caveats below.
 - **`VARS=id:glob` bypasses the map entirely.** An explicit glob on the CLI
   skips `VARS_MAP` lookup and its ordering guarantees — useful for one-off
   debugging, risky as a habit.
-- **The `:all` tasks are load-bearing-weird.** `tf:plan:all`,
-  `tf:init:once:all`, and `tf:setup:all` deliberately carry no env anchor and
-  keep `env -u TF_DATA_DIR` on their nested calls; do not "clean up" that
-  asymmetry.
+- **Nested task calls go through the wrapper.** A hand-written loop or shim
+  that runs bare `task` from its shell inherits the caller's `V_*` and
+  `TF_DATA_DIR` and loses its command-line selectors. Use `scripts/tf-stack.sh
+  task …` (convention 4), even where a bare call looks like it works.
 - **`tf:use` gitignores `*.env`, not `<stack>.env`.** Any file ending `.env`,
   anywhere in the repo, is covered by the same gitignore line; that is
   intentional, not a narrower per-stack rule.

@@ -156,14 +156,14 @@ check1() {
 }
 
 # ---------------------------------------------------------------------
-# 2. scripts/tf-stack.sh help lists exactly the expected 62 function
+# 2. scripts/tf-stack.sh help lists exactly the expected 89 function
 # names -- catches a truncated copy. This set is the frozen ABI (dev-tf
-# plan section 4): a byte-for-byte copy always carries all 62, regardless
+# plan section 4): a byte-for-byte copy always carries all 89, regardless
 # of which backend/toolchain the target repo uses, and regardless of
 # whether its stacks keep their backends in .backend.hcl files or inline.
 # ---------------------------------------------------------------------
 check2() {
-  local label="2 $SCRIPT help lists exactly 62 functions"
+  local label="2 $SCRIPT help lists exactly 89 functions"
   if [ ! -x "$SCRIPT" ] && [ ! -f "$SCRIPT" ]; then
     fail "$label" "$SCRIPT not found"
     return
@@ -232,13 +232,40 @@ tf_secrets_new
 tf_secrets_pull
 tf_secrets_push
 tf_secrets_setup
+SEED_TARGETS
+_deploy_run
+_deploy_unit
+_deploy_units
+_seeds_call_refs
+_seeds_calls
+_seeds_edges
+_seeds_found
+_seeds_has_line
+_seeds_loop
+_seeds_module_calls
+_seeds_outputs
+_seeds_problem
+_seeds_reader
+_seeds_reader_uses
+_seeds_resolve
+_seeds_vars_ids
+task
+tf_deploy_apply
+tf_deploy_plan
+tf_seed_new
+tf_seed_plan
+tf_seeds_apply
+tf_seeds_check
+tf_seeds_list
+tf_seeds_order
+tf_seeds_plan
 NAMES
 )
   local expected_sorted expected_count
   expected_sorted=$(printf '%s\n' "$expected" | sort)
   expected_count=$(printf '%s\n' "$expected_sorted" | grep -c .)
-  if [ "$expected_count" -ne 62 ]; then
-    fail "$label" "internal error in tf-verify.sh: expected list has $expected_count names, not 62"
+  if [ "$expected_count" -ne 89 ]; then
+    fail "$label" "internal error in tf-verify.sh: expected list has $expected_count names, not 89"
     return
   fi
 
@@ -304,6 +331,15 @@ tf:secrets:new:ask
 tf:secrets:pull:ask
 tf:secrets:push:ask
 tf:secrets:assert
+tf:seeds:list
+tf:seeds:check
+tf:seed:new
+tf:seed:plan
+tf:seed:apply:ask
+tf:seeds:plan
+tf:seeds:apply:ask
+tf:deploy:plan
+tf:deploy:apply:ask
 tf:verify'
 
 GUARD_TASKS='tf:stack:assert

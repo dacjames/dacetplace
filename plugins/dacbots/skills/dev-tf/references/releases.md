@@ -45,10 +45,73 @@ and add an entry at the top, in this shape:
 SKILL.md's UPDATE steps do not change. Two things there do, if the release
 touches them: the Modes detection rule relies on every release defining the 22
 base names listed under 0.3.0, so a release that drops or renames one must
-change that rule; and the counts SKILL.md quotes (62 names, 43 `vars:`
+change that rule; and the counts SKILL.md quotes (89 names, 46 `vars:`
 entries, 8 tokens).
 
 ---
+
+## 0.9.0 — seeds, two-phase deploy, nested task calls
+
+- **Changes:**
+  - **Seeds.** A stack can publish the stateful values other stacks read as a
+    seed in `stacks/<maker>/seeds/<seed>/`, read through a scaffolded `read/`
+    module over the maker's state. Until the seed exists the reader returns
+    placeholders, so a plan works and any apply refuses. The seed phase
+    (`tf:seeds:apply:ask`) applies only the seed calls, in dependency order;
+    the deploy phase (`tf:deploy:plan`, `tf:deploy:apply:ask`) then runs every
+    stack and VARS id in parallel. Nothing changes for a repo with no `seeds/`
+    dir.
+  - **Nested task calls.** The `:all` loops, and every other task that runs
+    `task` from its shell, go through `scripts/tf-stack.sh task`. It clears
+    `V_*` and `TF_DATA_DIR` and passes on the run-wide selectors, so `task
+    tf:plan:all TF=terraform` now plans every VARS id with terraform (before:
+    tofu), and `NO_LOCK=true` reaches each plan.
+- **Signature:** 89 names: 0.7.x's 62 plus `SEED_TARGETS`, `task`,
+  `tf_seed_new`, `tf_seed_plan`, five `tf_seeds_*`, two `tf_deploy_*`, 13
+  `_seeds_*` and three `_deploy_*` helpers. `task` alone tells it apart. The
+  Taskfile has 46 `vars:` entries and the nine tasks below. Script blob
+  `408f173251fc45dcb70e5c25d7720bf34299028f`.
+- **Toolkit-owned surface:**
+  - nine tasks: `tf:seeds:list`, `tf:seeds:check`, `tf:seed:new`,
+    `tf:seed:plan`, `tf:seed:apply:ask`, `tf:seeds:plan`,
+    `tf:seeds:apply:ask`, `tf:deploy:plan`, `tf:deploy:apply:ask`;
+  - three `vars:` entries (`SEED_PLAN_FILE`, `SEED_TARGETS`, `PARALLEL`) and
+    six anchor keys (`V_SEED_PLAN_FILE`, `V_SEED_TARGETS`, `V_PARALLEL`,
+    `V_VAR_FILES`, `V__NO_COLOR`, `V__NO_LOCK`);
+  - `env: *tf_stack_env` on `tf:plan:all`, `tf:init:once:all` and
+    `tf:setup:all`, whose nested calls become `scripts/tf-stack.sh task …`;
+  - `tf:verify` check 2 expecting 89 names and check 3 the nine tasks;
+  - the Seeds section of `docs/tf-stack.md`.
+
+  **Changed meaning:** `V_NO_COLOR` and `V_NO_LOCK` now hold the raw
+  `true`/`false`; the rendered flags moved to `V__NO_COLOR`/`V__NO_LOCK`. The
+  script and the block must change together, as U5 does: a 0.9.0 script under
+  a 0.8.x block silently drops `-no-color` and `-lock=false`. `PARALLEL`
+  (default 4) is a repo-owned setting: kept when already set.
+- **Replaces:** a hand-written loop or CI compat shim that nests `task` from
+  its shell, found with `grep -n 'env -u TF_DATA_DIR task' Taskfile.yml`
+  outside the toolkit block. Each becomes `scripts/tf-stack.sh task <same
+  arguments>`, with `env: *tf_stack_env` on its task; a shim keeps its
+  permission rule. Seeds are opt-in, so cross-stack reads are not retired:
+  list any `data "terraform_remote_state"` in a stack (`grep -rn
+  terraform_remote_state <STACKS_DIR>`) in the report as seed candidates.
+- **After updating:** none required. To adopt a seed: `task tf:seed:new
+  STACK=… SEED=…`, then `task tf:init:init STACK=…` once for the new module
+  call; `docs/tf-stack.md` ("Seeds") has the rest.
+
+## 0.8.1 — exact mode arguments
+
+- **Changes:** nothing in a target repo. `migrate` and `greenfield` now say
+  exactly what they do: `migrate` adds MIGRATE's obligations (and reads a
+  `tf-add` Taskfile as `tf-replace`); `greenfield` checks detection rather
+  than overriding it. Neither can remove a backup, CI-name freeze or move
+  confirmation.
+- **Signature:** the same as 0.7.1 (script blob
+  `25fb1f081f1e1f92cf6b885a32836576d29bb6fe`); reads as 0.8.1.
+- **Replaces:** nothing.
+- **After updating:** none.
+- **Published:** never on its own. dacbots went from 0.8.0 to 0.9.0, which
+  carries this change.
 
 ## 0.8.0 — UPDATE mode
 
@@ -56,7 +119,8 @@ entries, 8 tokens).
   mode and this file; no asset and no `references/tf-stack.md` line changed.
 - **Signature:** the same as 0.7.1 (script blob
   `25fb1f081f1e1f92cf6b885a32836576d29bb6fe`). An install of 0.8.0 cannot be
-  told from one of 0.7.1; both read as 0.8.0, the newest release.
+  told from one of 0.7.1; both read as the newest release with that
+  signature.
 - **Replaces:** nothing.
 - **After updating:** none.
 

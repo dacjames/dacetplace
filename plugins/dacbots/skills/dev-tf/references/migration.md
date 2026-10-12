@@ -57,7 +57,7 @@ nothing about what a wrapper task's `cmds:` actually run.
 | `tf:init` | `tf:init:once` | `aliases:` on the canonical task | none — read-only |
 | `tf:validate` | `tf:validate` | already the canonical name | none |
 | `tf:fmt` | `tf:fmt` | already the canonical name | none |
-| `tf:apply` | `tf:apply:ask` | visible wrapper task, `desc: 'CI compat shim for tf:apply:ask -- remove after stabilization'`, one shell command line `env -u TF_DATA_DIR task tf:apply:ask STACK=<s> VARS=<id>` (never `cmds: [{task: …, vars: …}]`, whose vars do not reach the guards; SKILL.md step 10) | `Bash(task tf:apply)` in `permissions.ask` |
+| `tf:apply` | `tf:apply:ask` | visible wrapper task, `desc: 'CI compat shim for tf:apply:ask -- remove after stabilization'`, `env: *tf_stack_env` and one shell command line `scripts/tf-stack.sh task tf:apply:ask STACK=<s> VARS=<id>` (never `cmds: [{task: …, vars: …}]`, whose vars do not reach the guards; SKILL.md step 10) | `Bash(task tf:apply)` in `permissions.ask` |
 | `tf:destroy` | `tf:destroy:deny` | visible wrapper task, same shape, worded for destroy | `Bash(task tf:destroy)` in `permissions.deny` |
 | `set-env-<env>` | `tf:use STACK=<s> VARS=<env>` | one ungated wrapper task per env running that command | none — writes only a local, gitignored `<stack>.env` file |
 
@@ -299,11 +299,11 @@ hand-edited copy of the asset — treat it as a bug, not a style choice.
 **Functions dropped from `tf-stack.sh` (5):** `tf_export_show`,
 `tf_export_publish`, `tf_export_query`, `tf_export_query_json`
 (BigQuery publishing), `tf_refresh_diff` (Cloud Asset Inventory-backed
-freshness checking). None of the surviving 62 functions call these, and
+freshness checking). None of the surviving 89 functions call these, and
 none of the surviving `tf:*` tasks depend on them. That strip is the
 only transformation: `assets/tf-stack.sh` is the source repo's
 `scripts/tf-stack.sh` with those five functions removed and nothing
-else changed, so 62 of its 67 functions survive byte for byte. The
+else changed, so 89 of its 94 functions survive byte for byte. The
 secrets functions are among the survivors (`SECRETS_DISCOVER`,
 `tf_secrets`, `tf_secrets_setup`, `tf_secrets_new`, `tf_secrets_pull`,
 `tf_secrets_push`, `tf_secrets_assert` and 23 `_secrets_*` helpers), as
@@ -340,15 +340,14 @@ source's `test` also depended on `org:test`, `tf:export:test`,
 namespaces or suites this skill does not ship.
 
 **Anchor keys dropped:** the `tf_stack_env` anchor carries the keys the
-62 surviving functions read (the secrets ones among them:
+89 surviving functions read (the secrets ones among them:
 `V_SECRETS_PROJECT`, `V_SECRET_PREFIX`, `V_SECRETS_DIR`, `V_SECRETS_FILE`,
-`V_SECRET_TFVARS`, `V_SECRETS_TF`, `V_USER_WORKING_DIR`), plus
-`V_ROOT_DIR` for the repo root.
+`V_SECRET_TFVARS`, `V_SECRETS_TF`, `V_USER_WORKING_DIR`; the seeds ones:
+`V_SEED_PLAN_FILE`, `V_SEED_TARGETS`, `V_PARALLEL`, and `V_VAR_FILES`, which
+`tf_seed_plan` passes to tofu), plus `V_ROOT_DIR` for the repo root.
 Dropped: `V_ORG_ID`, `V_PLUGIN_CACHE`, `V_REFRESH_DIFF_DIR`,
-`V_REFRESH_DIFF_TYPES`, `V_VAR_FILES` — each read only by a dropped
-function or a dropped namespace. (`VAR_FILES` itself, the Taskfile var,
-stays: the plan, apply, refresh and destroy tasks pass it to tofu. Only
-its `V_` copy went.) Every key that stays
+`V_REFRESH_DIFF_TYPES` — each read only by a dropped function or a dropped
+namespace. Every key that stays
 keeps its source spelling, `V_BOOTSTRAP_PROJECT` included: it names the
 project that owns the state bucket, which is what `tf_setup` still reads
 it for.

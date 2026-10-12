@@ -66,6 +66,10 @@ tf_stack_env: &tf_stack_env
   V_VARS_MAP: "{{.VARS_MAP}}"
   V_DATA_DIR: "{{.DATA_DIR}}"
   V_PLAN_FILE: "{{.PLAN_FILE}}"
+  V_VAR_FILES: "{{.VAR_FILES}}"
+  V_SEED_PLAN_FILE: "{{.SEED_PLAN_FILE}}"
+  V_SEED_TARGETS: "{{.SEED_TARGETS}}"
+  V_PARALLEL: "{{.PARALLEL}}"
   V_SECRETS_PROJECT: "{{.SECRETS_PROJECT}}"
   V_SECRET_PREFIX: "{{.SECRET_PREFIX}}"
   V_SECRETS_DIR: "{{.SECRETS_DIR}}"
@@ -73,8 +77,10 @@ tf_stack_env: &tf_stack_env
   V_SECRET_TFVARS: "{{.SECRET_TFVARS}}"
   V_SECRETS_TF: "{{.SECRETS_TF}}"
   V_USER_WORKING_DIR: "{{.USER_WORKING_DIR}}"
-  V_NO_COLOR: "{{._NO_COLOR}}"
-  V_NO_LOCK: "{{._NO_LOCK}}"
+  V_NO_COLOR: "{{.NO_COLOR}}"
+  V_NO_LOCK: "{{.NO_LOCK}}"
+  V__NO_COLOR: "{{._NO_COLOR}}"
+  V__NO_LOCK: "{{._NO_LOCK}}"
 
 vars:
   # -- globals -- #
@@ -203,9 +209,9 @@ vars:
 
   # DATA_DIR is keyed by TF/BACKEND_ID so different toolchains or backends
   # never collide on the same .terraform dir; env: above sets TF_DATA_DIR
-  # from it globally. The :all tasks run `env -u TF_DATA_DIR task ...
-  # BACKEND=$b` per backend so each loop iteration recomputes its own
-  # DATA_DIR instead of inheriting the parent invocation's.
+  # from it globally. The :all tasks run each backend through
+  # `scripts/tf-stack.sh task`, which unsets TF_DATA_DIR so each loop iteration
+  # recomputes its own DATA_DIR instead of inheriting the parent invocation's.
   DATA_DIR: '.terraform-{{.TF}}-{{.BACKEND_ID}}'
   DATA_DIR_LOCAL: '{{.DATA_DIR}}-local'
 
@@ -213,6 +219,14 @@ vars:
   # share a plan file, and so the plan applied by tf:apply:ask is always
   # the one just planned for this exact combination
   PLAN_FILE: '{{.ROOT_DIR}}/{{.TMP}}/{{.STACK}}-{{.VARS_ID}}-{{.BACKEND_ID}}-{{.TF}}.tfplan'
+
+  # seeds: the plan tf:seed:plan saves (PLAN_FILE with .seed.tfplan, so it never replaces a
+  # full plan), the -target flags that select the stack's seed calls (see SEED_TARGETS in
+  # tf-stack.sh), and how many stacks tf:deploy:plan and tf:deploy:apply:ask run at once
+  SEED_PLAN_FILE: '{{trimSuffix ".tfplan" .PLAN_FILE}}.seed.tfplan'
+  SEED_TARGETS:
+    sh: "scripts/tf-stack.sh SEED_TARGETS '{{.STACK_DIR}}'"
+  PARALLEL: '{{.PARALLEL | default "4"}}'
 
 tasks:
   tmp:setup:
@@ -314,10 +328,9 @@ tasks:
   tf:setup:all:
     desc: Run tf:setup once per backend {{.STACK}} actually has
     silent: false
+    env: *tf_stack_env
     cmds:
-      # inline because recursively calling task from script with env has unknown bug.
-      # clears TF_DATA_DIR on each task invocation to allow it to be re-computed from
-      # the parameters in that iteration (ex: BACKEND=dev, BACKEND=preprod, etc.)
+      # one nested task per backend, see tf:init:once:all
       - |
         set -euo pipefail
         ran=0
@@ -326,13 +339,13 @@ tasks:
           file=$(scripts/tf-stack.sh BACKEND_FILE "$resolved")
           if [ -n "$file" ] && [ "$(scripts/tf-stack.sh BACKEND_KIND "{{.STACK_DIR}}/$file")" != none ]; then
             echo "== $b"
-            env -u TF_DATA_DIR task tf:setup STACK={{.STACK}} BACKEND="$b"
+            scripts/tf-stack.sh task tf:setup STACK={{.STACK}} BACKEND="$b"
             ran=$((ran + 1))
           fi
         done
         if [ "$ran" = 0 ]; then
           echo "== {{.STACK}}"
-          env -u TF_DATA_DIR task tf:setup STACK={{.STACK}}
+          scripts/tf-stack.sh task tf:setup STACK={{.STACK}}
         fi
 
   # ==== END CONDITIONAL: gcs ==== #
@@ -358,12 +371,15 @@ tasks:
       - task: tf:backend:assert
       - '{{.ROOT_DIR}}/scripts/tf-stack.sh tf_init_init {{.CLI_ARGS}}'
 
+  # The :all loops (tf:init:once:all, tf:setup:all, tf:plan:all) call each iteration
+  # through `scripts/tf-stack.sh task`, which clears what the iteration must work out
+  # again (V_*, TF_DATA_DIR) and passes on the run-wide selectors given on this command
+  # line (TF=terraform, NO_LOCK=true); see `task` in tf-stack.sh. They carry the
+  # tf_stack_env block so it has those V_* to pass on.
   tf:init:once:all:
     desc: Initialize {{.STACK}} for every backend it has, skipping the ones already initialised
+    env: *tf_stack_env
     cmds:
-      # inline because recursively calling task from script with env has unknown bug.
-      # clears TF_DATA_DIR on each task invocation to allow it to be re-computed from
-      # the parameters in that iteration (ex: BACKEND=dev, BACKEND=preprod, etc.)
       - |
         set -euo pipefail
         ran=0
@@ -371,12 +387,12 @@ tasks:
           resolved=$(scripts/tf-stack.sh BACKEND_RESOLVED "$b" '{{.BACKEND_MAP}}')
           file=$(scripts/tf-stack.sh BACKEND_FILE "$resolved")
           if [ -n "$file" ] && [ "$(scripts/tf-stack.sh BACKEND_KIND "{{.STACK_DIR}}/$file")" != none ]; then
-            env -u TF_DATA_DIR task tf:init:once STACK={{.STACK}} BACKEND="$b"
+            scripts/tf-stack.sh task tf:init:once STACK={{.STACK}} BACKEND="$b"
             ran=$((ran + 1))
           fi
         done
         if [ "$ran" = 0 ]; then
-          env -u TF_DATA_DIR task tf:init:once STACK={{.STACK}}
+          scripts/tf-stack.sh task tf:init:once STACK={{.STACK}}
         fi
 
   tf:init:local:
@@ -580,20 +596,19 @@ tasks:
   tf:plan:all:
     desc: Plan {{.STACK}} once per name in VARS_MAP it has, or once with its default VARS
     silent: false
+    env: *tf_stack_env
     cmds:
-      # inline because recursively calling task from script with env has unknown bug.
-      # clears TF_DATA_DIR on each task invocation to allow it to be re-computed from
-      # the parameters in that iteration (ex: VARS=dev, VARS=preprod, etc.)
+      # one nested task per VARS id, see tf:init:once:all
       - |
         set -euo pipefail
         ran=0
         for v in $(scripts/tf-stack.sh VARS_IDS_PRESENT '{{.STACK_DIR}}' '{{.VARS_MAP}}'); do
           echo "== $v"
-          env -u TF_DATA_DIR task tf:plan STACK={{.STACK}} VARS="$v"
+          scripts/tf-stack.sh task tf:plan STACK={{.STACK}} VARS="$v"
           ran=$((ran + 1))
         done
         if [ "$ran" = 0 ]; then
-          env -u TF_DATA_DIR task tf:plan STACK={{.STACK}}
+          scripts/tf-stack.sh task tf:plan STACK={{.STACK}}
         fi
 
   tf:plan:debug:
@@ -680,6 +695,88 @@ tasks:
       - task: tf:vars:assert
       - task: tf:init:once
       - '{{.TF}} force-unlock -force {{.VAR_FILES}} {{.CLI_ARGS}} {{.ID}}'
+
+  # tf:seeds:*, tf:seed:* and tf:deploy:* -- seeds, the part of a stack that other stacks read;
+  # see docs/tf-stack.md. The singular tasks act on one STACK/VARS
+  # like tf:plan and tf:apply:ask. The plural ones loop over every maker stack in seed order
+  # and call the singular ones through `task` in tf-stack.sh, as the :all loops do;
+  # tf:deploy:* runs every stack at once.
+  tf:seeds:list:
+    desc: List the seeds under {{.STACKS_DIR}}/*/seeds/, where each is called and which stacks read it
+    silent: false
+    env: *tf_stack_env
+    cmds:
+      - scripts/tf-stack.sh tf_seeds_list
+
+  tf:seeds:check:
+    desc: Lint every seed - call, root output, reader mirroring the outputs, reader sources, no cycle
+    silent: false
+    env: *tf_stack_env
+    cmds:
+      - scripts/tf-stack.sh tf_seeds_check
+
+  tf:seed:new:
+    desc: Scaffold the reader for SEED=<name> in {{.STACK}} (and the seed stub and call if missing); files only
+    silent: false
+    env: *tf_stack_env
+    preconditions:
+      - sh: test -n "{{.SEED}}"
+        msg: 'SEED is required -- the seed name: task tf:seed:new STACK={{.STACK}} SEED=<name>'
+    cmds:
+      - scripts/tf-stack.sh tf_seed_new '{{.SEED}}'
+
+  tf:seed:plan:
+    desc: Plan only the seed calls of {{.STACK}} (-target) and save the plan to {{.TMP}}
+    dir: '{{.STACK_DIR}}'
+    env: *tf_stack_env
+    cmds:
+      - task: tf:vars:assert
+      - task: tf:secrets:assert
+      - task: tf:init:once
+      - '{{.ROOT_DIR}}/scripts/tf-stack.sh tf_seed_plan'
+
+  tf:seed:apply:ask:
+    desc: Apply the saved seed plan of {{.STACK}} (ai-ask gated)
+    dir: '{{.STACK_DIR}}'
+    preconditions:
+      - sh: test -f {{.SEED_PLAN_FILE}}
+        msg: 'no seed plan at {{.SEED_PLAN_FILE}} -- plan first: task tf:seed:plan STACK={{.STACK}} VARS={{.VARS_ID}}'
+    cmds:
+      - task: tf:stack:assert
+      - task: tf:toolchain:assert:tofu
+      - task: tf:vars:assert
+      - task: tf:secrets:assert
+      - task: tf:init:once
+      - '{{.TF}} apply {{._NO_COLOR}} {{.VAR_FILES}} {{.SEED_PLAN_FILE}} {{.CLI_ARGS}}'
+
+  tf:seeds:plan:
+    desc: Seed phase, plan - tf:seed:plan for every maker stack and VARS id, in seed order
+    silent: false
+    env: *tf_stack_env
+    cmds:
+      - scripts/tf-stack.sh tf_seeds_plan
+
+  tf:seeds:apply:ask:
+    desc: Seed phase - plan then apply the seeds of every maker stack and VARS id, in seed order (ai-ask gated)
+    silent: false
+    env: *tf_stack_env
+    cmds:
+      - scripts/tf-stack.sh tf_seeds_apply
+
+  tf:deploy:plan:
+    desc: Deploy phase, plan - tf:plan for every stack and VARS id, {{.PARALLEL}} at a time (PARALLEL=n)
+    silent: false
+    env: *tf_stack_env
+    cmds:
+      - scripts/tf-stack.sh tf_deploy_plan
+
+  tf:deploy:apply:ask:
+    desc: Deploy phase - tf:apply:ask for every stack and VARS id, {{.PARALLEL}} at a time (PARALLEL=n) (ai-ask gated)
+    silent: false
+    env: *tf_stack_env
+    cmds:
+      - scripts/tf-stack.sh tf_deploy_apply
+
 
   tf:destroy:deny:
     desc: Destroy all managed infrastructure in the {{.STACK}} stack (ai-deny gated)

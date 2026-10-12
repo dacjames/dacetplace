@@ -745,9 +745,9 @@ tf_setup() {
 tf_init_init() {
   local init
   if [ "$(BACKEND_KIND "$V_BACKEND_FILE")" = config ]; then
-    init="$V_TF init -input=false -backend-config=$V_BACKEND_FILE $V_NO_COLOR"
+    init="$V_TF init -input=false -backend-config=$V_BACKEND_FILE $V__NO_COLOR"
   else
-    init="$V_TF init -input=false $V_NO_COLOR"
+    init="$V_TF init -input=false $V__NO_COLOR"
   fi
   $init "$@" || {
     echo "init failed; retrying with -reconfigure (stale backend cache in $V_DATA_DIR?)" >&2
@@ -760,7 +760,7 @@ tf_validate_all() {
   local s
   for s in $V_STACKS; do
     echo "== $s"
-    env -u TF_DATA_DIR task tf:validate:local STACK="$s"
+    task tf:validate:local STACK="$s"
   done
 }
 
@@ -1848,6 +1848,847 @@ EOF
     exit "$rc"
   fi
 }
+
+# -- seeds ---------------------------------------------------------------------
+#
+# A seed is the small part of a stack that creates the values other stacks need,
+# lifted into a module of its own so that those stacks can read it from the
+# maker's state instead of depending on the whole maker. Concept: docs/specs/
+# seeds.md. Layout, for maker stack S and seed X:
+#
+#   S/seeds/X/*.tf       the seed module: its resources and one output per value
+#   S/seeds/X/read/      the reader, scaffolded by tf:seed:new: same outputs,
+#                        fed from S's state, placeholders until S has applied X
+#   S/seeds.tf           module "X" { source = "./seeds/X" } and output "seed_X"
+#
+# The functions below discover seeds by reading the .tf files (nothing is
+# registered anywhere), lint them, order them, scaffold one, and run the two
+# repo-wide phases: the seed phase (targeted plan and apply of every seed call, in
+# dependency order) and the deploy phase (every stack at once).
+
+# Every STACKS_DIR/<stack>/seeds/<seed>/ as "<stack>\t<seed>".
+_seeds_found() {
+  local root d s x
+  root="${V_STACKS_DIR:-stacks}"
+  for d in "$root"/*/seeds/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    x=${d##*/}
+    s=${d%/seeds/*}
+    s=${s##*/}
+    printf '%s\t%s\n' "$s" "$x"
+  done
+}
+
+# The top-level module blocks of one .tf file as "<label>\t<source>". A module
+# with no literal source gets none.
+_seeds_module_calls() {
+  _hcl_blocks module "$1" | awk '
+    function flush() { if (label != "" && src != "") printf "%s\t%s\n", label, src; label = ""; src = "" }
+    /^module[ \t]*"[^"]*"[ \t]*[{]/ {
+      flush()
+      label = $0
+      sub(/^module[ \t]*"/, "", label)
+      sub(/".*/, "", label)
+    }
+    label != "" && src == "" && match($0, /(^|[ \t{])source[ \t]*=[ \t]*"[^"]*"/) {
+      src = substr($0, RSTART, RLENGTH)
+      sub(/^[^"]*"/, "", src)
+      sub(/"$/, "", src)
+    }
+    END { flush() }'
+}
+
+# The output blocks of the *.tf files directly in a directory as
+# "<name>\t<sensitive 0|1>", in file order.
+_seeds_outputs() {
+  local dir="$1" f
+  for f in "$dir"/*.tf; do
+    [ -f "$f" ] || continue
+    _hcl_blocks output "$f" | awk '
+      function flush() { if (name != "") printf "%s\t%d\n", name, sens; name = ""; sens = 0 }
+      /^output[ \t]*"[^"]*"[ \t]*[{]/ {
+        flush()
+        name = $0
+        sub(/^output[ \t]*"/, "", name)
+        sub(/".*/, "", name)
+      }
+      name != "" && /(^|[ \t{])sensitive[ \t]*=[ \t]*true([ \t}]|$)/ { sens = 1 }
+      END { flush() }'
+  done
+}
+
+# The seed calls of a stack: "<seed>\t<module label>" for every module block in
+# its root *.tf whose source is exactly ./seeds/<seed> and whose directory exists.
+_seeds_calls() {
+  local dir="$1" f label src x
+  for f in "$dir"/*.tf; do
+    [ -f "$f" ] || continue
+    while IFS=$TAB read -r label src; do
+      [ -n "$label" ] || continue
+      case "$src" in
+        ./seeds/*/*|./seeds/) continue ;;
+        ./seeds/*) ;;
+        *) continue ;;
+      esac
+      x=${src#./seeds/}
+      [ -d "$dir/seeds/$x" ] && printf '%s\t%s\n' "$x" "$label"
+    done <<EOF
+$(_seeds_module_calls "$f")
+EOF
+  done
+  return 0
+}
+
+# Where a reader source, written in a file in $1, points: "<stack>\t<seed>" when it
+# is the read/ directory of an existing seed under STACKS_DIR, nothing otherwise.
+_seeds_resolve() {
+  local dir="$1" src="$2" root abs rel s x
+  root=$(cd "${V_STACKS_DIR:-stacks}" 2>/dev/null && pwd -P) || return 1
+  abs=$(cd "$dir/$src" 2>/dev/null && pwd -P) || return 1
+  case "$abs" in "$root"/*/seeds/*/read) ;; *) return 1 ;; esac
+  rel=${abs#"$root"/}
+  s=${rel%%/*}
+  x=${rel#*/seeds/}
+  x=${x%/read}
+  case "$x" in */*) return 1 ;; esac
+  [ -d "$root/$s/seeds/$x" ] || return 1
+  printf '%s\t%s\n' "$s" "$x"
+}
+
+# Every call to a seed reader in the repo, one row each, columns
+#   user stack, file (stack-relative), module label, source, maker stack, seed
+# with "-" in the last two when the source points at no existing seed. A reader
+# call is a module whose source is a relative path ending in /seeds/<seed>/read,
+# in a stack's root *.tf or anywhere under its seeds/ (the read/ dirs excepted:
+# a reader reads nothing but its maker).
+_seeds_reader_uses() {
+  local root d s f rel label src resolved ms mx files
+  root="${V_STACKS_DIR:-stacks}"
+  for d in "$root"/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    s=${d##*/}
+    files=$(for f in "$d"/*.tf; do [ -f "$f" ] && printf '%s\n' "$f"; done; find "$d/seeds" -name '*.tf' -not -path '*/read/*' 2>/dev/null | sort || true)
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      rel=${f#"$d"/}
+      while IFS=$TAB read -r label src; do
+        [ -n "$label" ] || continue
+        case "$src" in
+          ./*/seeds/*/read|../*/seeds/*/read|./seeds/*/read|../seeds/*/read) ;;
+          *) continue ;;
+        esac
+        ms=-
+        mx=-
+        resolved=$(_seeds_resolve "$(dirname "$f")" "$src") || resolved=
+        if [ -n "$resolved" ]; then
+          ms=${resolved%%$TAB*}
+          mx=${resolved#*$TAB}
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$s" "$rel" "$label" "$src" "$ms" "$mx"
+      done <<EOF
+$(_seeds_module_calls "$f")
+EOF
+    done <<EOF
+$files
+EOF
+  done
+  return 0
+}
+
+# Which of the given reader labels the seed call blocks of one file refer to,
+# as module.<label>: that is a seed built from another stack's seed.
+_seeds_call_refs() {
+  local file="$1"
+  shift
+  [ $# -gt 0 ] || return 0
+  _hcl_blocks module "$file" | awk -v labels="$*" '
+    function flush(   i, n, l) {
+      if (isseed) {
+        n = split(labels, l, " ")
+        for (i = 1; i <= n; i++) if (match(body, "module[.]" l[i] "([^A-Za-z0-9_-]|$)")) print l[i]
+      }
+      body = ""
+      isseed = 0
+    }
+    /^module[ \t]*"[^"]*"[ \t]*[{]/ { flush() }
+    { body = body "\n" $0 }
+    /(^|[ \t{])source[ \t]*=[ \t]*"[.]\/seeds\/[A-Za-z0-9_-]+"/ { isseed = 1 }
+    END { flush() }'
+}
+
+# The ordering constraints between maker stacks, from _seeds_reader_uses output
+# ($1): "<A> <B>" lines, meaning A must be seeded after B. A is after B when a
+# file under A/seeds/ calls a reader of a seed B makes, or a seed call block in
+# A's root refers to such a reader call. A stack reading its own seed is no edge.
+_seeds_edges() {
+  local uses="$1" root u labels f l ms
+  root="${V_STACKS_DIR:-stacks}"
+  printf '%s\n' "$uses" |
+    awk -F'\t' '$2 ~ /^seeds\// && $5 != "-" && $5 != $1 { print $1 " " $5 }'
+  for u in $(printf '%s\n' "$uses" | awk -F'\t' '$2 != "" && $2 !~ /^seeds\// { print $1 }' | sort -u); do
+    labels=$(printf '%s\n' "$uses" | awk -F'\t' -v u="$u" '$1 == u && $2 !~ /^seeds\// { print $3 }' | tr '\n' ' ')
+    for f in "$root/$u"/*.tf; do
+      [ -f "$f" ] || continue
+      for l in $(_seeds_call_refs "$f" $labels); do
+        ms=$(printf '%s\n' "$uses" |
+          awk -F'\t' -v u="$u" -v l="$l" '$1 == u && $3 == l && $2 !~ /^seeds\// && !done { print $5; done = 1 }')
+        if [ -n "$ms" ] && [ "$ms" != - ] && [ "$ms" != "$u" ]; then
+          printf '%s %s\n' "$u" "$ms"
+        fi
+      done
+    done
+  done
+  return 0
+}
+
+# tf_seeds_order -- the maker stacks in the order their seeds must be applied: a
+# stack comes after every stack whose seeds it reads. Stacks with no constraint
+# between them keep name order. A cycle is an error naming the stacks in it.
+# (Sorted by hand: macOS tsort exits 0 on a cycle.)
+tf_seeds_order() {
+  local uses edges remaining n b blocked pick out="" core changed d
+  uses=$(_seeds_reader_uses)
+  edges=$(_seeds_edges "$uses" | sort -u)
+  remaining=$(_seeds_found | cut -f1 | sort -u | tr '\n' ' ')
+  remaining=${remaining% }
+  while [ -n "$remaining" ]; do
+    pick=
+    for n in $remaining; do
+      blocked=0
+      for b in $(printf '%s\n' "$edges" | awk -v n="$n" '$1 == n { print $2 }'); do
+        case " $remaining " in *" $b "*) blocked=1 ;; esac
+      done
+      if [ "$blocked" = 0 ]; then
+        pick=$n
+        break
+      fi
+    done
+    if [ -z "$pick" ]; then
+      # What is left is the cycles and whatever is built on them. Peel off the
+      # stacks that nothing left depends on, so the message names only the cycle.
+      core=$remaining
+      changed=1
+      while [ "$changed" = 1 ]; do
+        changed=0
+        for n in $core; do
+          d=$(printf '%s\n' "$edges" | awk -v n="$n" -v core=" $core " '$2 == n && index(core, " " $1 " ") { c++ } END { print c + 0 }')
+          if [ "$d" = 0 ]; then
+            core=$(printf '%s\n' $core | grep -vx "$n" | tr '\n' ' ' || true)
+            changed=1
+            break
+          fi
+        done
+      done
+      echo "seed dependency cycle among stacks:$(printf ' %s' $core)" >&2
+      echo "each reads a seed that the next one makes (tf:seeds:list shows who reads what)" >&2
+      return 1
+    fi
+    out="$out$pick"$'\n'
+    remaining=$(printf '%s\n' $remaining | grep -vx "$pick" | tr '\n' ' ' || true)
+    remaining=${remaining% }
+  done
+  printf '%s' "$out"
+}
+
+# True when the newline-separated list $1 holds the line $2.
+_seeds_has_line() {
+  case "
+$1
+" in
+    *"
+$2
+"*) return 0 ;;
+  esac
+  return 1
+}
+
+# tf:seeds:list -- one row per seed: where it is called, its root output, and
+# every stack and file that calls its reader.
+tf_seeds_list() {
+  local root found uses s x labels outs output readers
+  root="${V_STACKS_DIR:-stacks}"
+  found=$(_seeds_found)
+  uses=$(_seeds_reader_uses)
+  {
+    printf 'STACK\tSEED\tCALL\tOUTPUT\tREADERS\n'
+    while IFS=$TAB read -r s x; do
+      [ -n "$s" ] || continue
+      labels=$(_seeds_calls "$root/$s" | awk -F'\t' -v x="$x" '$1 == x { print $2 }' | paste -sd, -)
+      outs=$(_seeds_outputs "$root/$s" | cut -f1)
+      output=-
+      if _seeds_has_line "$outs" "seed_$x"; then output="seed_$x"; fi
+      readers=$(awk -F'\t' -v s="$s" -v x="$x" '$5 == s && $6 == x { print $1 ":" $2 }' <<EOF | sort -u | paste -sd, -
+$uses
+EOF
+      )
+      printf '%s\t%s\t%s\t%s\t%s\n' "$s" "$x" "${labels:--}" "$output" "${readers:--}"
+    done <<EOF
+$found
+EOF
+  } | column -t -s "$TAB"
+}
+
+_SEEDS_PROBLEMS=""
+_seeds_problem() { _SEEDS_PROBLEMS="$_SEEDS_PROBLEMS  $1"$'\n'; }
+
+# tf:seeds:check -- lint every seed in the repo. Reports every problem, then exits 1.
+tf_seeds_check() {
+  local root found uses s x sd calls outs line mirror has_tf f nseeds=0
+  root="${V_STACKS_DIR:-stacks}"
+  found=$(_seeds_found)
+  uses=$(_seeds_reader_uses)
+  _SEEDS_PROBLEMS=""
+
+  while IFS=$TAB read -r s x; do
+    [ -n "$s" ] || continue
+    nseeds=$((nseeds + 1))
+    sd="$root/$s/seeds/$x"
+    calls=$(_seeds_calls "$root/$s" | awk -F'\t' -v x="$x" '$1 == x { print $2 }')
+    [ -n "$calls" ] ||
+      _seeds_problem "$s.$x: no module in $s/*.tf has source \"./seeds/$x\" (the seed call, whose label is the -target)"
+    outs=$(_seeds_outputs "$root/$s" | cut -f1)
+    _seeds_has_line "$outs" "seed_$x" ||
+      _seeds_problem "$s.$x: $s has no root output \"seed_$x\" (output \"seed_$x\" { value = module.<call>  sensitive = true })"
+    if [ ! -d "$sd/read" ]; then
+      _seeds_problem "$s.$x: seeds/$x/read/ is missing. Scaffold it: task tf:seed:new STACK=$s SEED=$x"
+    elif has_tf=$(for f in "$sd/read"/*.tf; do [ -f "$f" ] && echo y; done; true) && [ -z "$has_tf" ]; then
+      _seeds_problem "$s.$x: seeds/$x/read/ holds no .tf files"
+    else
+      mirror=$({
+        _seeds_outputs "$sd" | sed "s/^/S$TAB/"
+        _seeds_outputs "$sd/read" | sed "s/^/R$TAB/"
+      } | awk -F'\t' '
+        $1 == "S" { s[$2] = $3 }
+        $1 == "R" { r[$2] = $3 }
+        END {
+          for (n in s) {
+            if (!(n in r)) print "the reader has no output \"" n "\""
+            else if (s[n] != r[n]) print "output \"" n "\" is" (s[n] ? "" : " not") " sensitive in the seed but" (r[n] ? "" : " not") " in the reader"
+          }
+          for (n in r) if (!(n in s)) print "the reader has output \"" n "\", which the seed does not"
+        }' | sort)
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        _seeds_problem "$s.$x: $line (seeds/$x/read must mirror the seed's outputs)"
+      done <<EOF
+$mirror
+EOF
+    fi
+  done <<EOF
+$found
+EOF
+
+  local u file label src ms mx
+  while IFS=$TAB read -r u file label src ms mx; do
+    [ -n "$u" ] || continue
+    [ "$ms" = - ] || continue
+    _seeds_problem "$u/$file: module \"$label\" reads $src, which is the read/ directory of no seed under $root"
+  done <<EOF
+$uses
+EOF
+
+  local cyc
+  if ! cyc=$(tf_seeds_order 2>&1 >/dev/null); then
+    _seeds_problem "$(printf '%s\n' "$cyc" | head -n 1)"
+  fi
+
+  if [ -n "$_SEEDS_PROBLEMS" ]; then
+    echo "tf:seeds:check: problems" >&2
+    printf '%s' "$_SEEDS_PROBLEMS" >&2
+    exit 1
+  fi
+  echo "tf:seeds:check: $nseeds seed(s), no problems"
+}
+
+# -- seed scaffolding -------------------------------------------------------------
+
+# The reader module for seed $2 of stack $1, on stdout. $3 is the maker's backend
+# type (local or gcs), $4 how the reader finds the backend's settings (config: the
+# maker's variables/<maker>.backend.hcl; inline: the .tf $5 that holds them), $6
+# the seed's outputs as "<name>\t<sensitive>" lines. Plain terraform, specialised
+# here rather than driven by a shared module, so a reader can be read, and edited,
+# on its own.
+_seeds_reader() {
+  local stack="$1" seed="$2" type="$3" mode="$4" inline="$5" outs="$6"
+  local name sens width=0
+
+  sed -e "s/@STACK@/$stack/g" -e "s/@SEED@/$seed/g" <<'EOF'
+# Reader for the seed @STACK@.@SEED@, made by task tf:seed:new. A stack that needs the
+# seed's values calls this module instead of reading the maker's state itself:
+#
+#   module "@SEED@" {
+#     source = "<path to this directory>"
+#     maker  = "<BACKEND id of the maker run>"
+#   }
+#
+# Until the maker has applied the seed the outputs carry the placeholders below, so a
+# plan works and the guard resource refuses any apply. Make each placeholder a
+# well-formed value, and the real one where it is known in advance. Keep the outputs in
+# step with the seed's own: task tf:seeds:check compares their names and sensitivity.
+
+variable "maker" {
+  type        = string
+  description = "BACKEND id of the maker run that holds the seed"
+}
+
+EOF
+
+  if [ "$mode" = config ]; then
+    cat <<'EOF'
+locals {
+  stack_dir    = "${path.module}/../../.."
+  backend_file = "${local.stack_dir}/variables/${var.maker}.backend.hcl"
+
+  config = {
+    for kv in regexall("(?m)^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*\"([^\"]*)\"", file(local.backend_file)) : kv[0] => kv[1]
+  }
+
+EOF
+  else
+    sed -e "s|@INLINE@|$inline|g" -e "s|@TYPE@|$type|g" <<'EOF'
+locals {
+  stack_dir    = "${path.module}/../../.."
+  backend_file = "${local.stack_dir}/@INLINE@"
+  backend_body = regex("(?s)backend\\s+\"@TYPE@\"\\s*\\{(.*?)\\}", file(local.backend_file))[0]
+
+  config = {
+    for kv in regexall("(?m)^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*\"([^\"]*)\"", local.backend_body) : kv[0] => kv[1]
+  }
+
+EOF
+  fi
+
+  if [ "$type" = local ]; then
+    cat <<'EOF'
+  # Non-empty, not merely present: a plan or apply of the maker creates an empty state
+  # file to take its lock, and reading that fails where a missing file does not.
+  state_path = startswith(local.config.path, "/") ? local.config.path : "${local.stack_dir}/${local.config.path}"
+  exists     = try(length(file(local.state_path)) > 0, false)
+
+EOF
+  else
+    cat <<'EOF'
+  prefix       = trimsuffix(try(local.config.prefix, ""), "/")
+  state_object = local.prefix == "" ? "default.tfstate" : "${local.prefix}/default.tfstate"
+  exists       = length(data.google_storage_bucket_objects.state.bucket_objects) > 0
+
+EOF
+  fi
+
+  sed -e "s/@SEED@/$seed/g" <<'EOF'
+  seed  = try(data.terraform_remote_state.maker[0].outputs.seed_@SEED@, null)
+  found = local.seed != null
+
+  placeholder = {
+EOF
+  while IFS=$TAB read -r name sens; do
+    [ -n "$name" ] || continue
+    [ ${#name} -le "$width" ] || width=${#name}
+  done <<EOF
+$outs
+EOF
+  while IFS=$TAB read -r name sens; do
+    [ -n "$name" ] || continue
+    printf '    %-*s = "placeholder-%s"\n' "$width" "$name" "$name"
+  done <<EOF
+$outs
+EOF
+  printf '  }\n}\n\n'
+
+  if [ "$type" = local ]; then
+    cat <<'EOF'
+data "terraform_remote_state" "maker" {
+  count   = local.exists ? 1 : 0
+  backend = "local"
+
+  config = {
+    path = local.state_path
+  }
+}
+EOF
+  else
+    cat <<'EOF'
+# Has the maker written its state yet? Not checked against GCP: if a gcs
+# terraform_remote_state with no state object comes back empty rather than failing,
+# this lookup is redundant, and harmless.
+data "google_storage_bucket_objects" "state" {
+  bucket = local.config.bucket
+  prefix = local.state_object
+}
+
+data "terraform_remote_state" "maker" {
+  count   = local.exists ? 1 : 0
+  backend = "gcs"
+  config  = local.config
+}
+EOF
+  fi
+
+  sed -e "s/@STACK@/$stack/g" -e "s/@SEED@/$seed/g" <<'EOF'
+
+# Planned while the seed is a placeholder, and refused at apply: the id is unknown
+# until the resource exists, so the postcondition cannot hold in a saved plan.
+resource "terraform_data" "placeholder_guard" {
+  count = local.found ? 0 : 1
+
+  lifecycle {
+    postcondition {
+      condition     = self.id == "never"
+      error_message = "seed @STACK@.@SEED@ is a placeholder: its maker (stack @STACK@, BACKEND=${var.maker}) has not applied it. Seed first with task tf:seeds:apply:ask, then plan again."
+    }
+  }
+}
+EOF
+
+  while IFS=$TAB read -r name sens; do
+    [ -n "$name" ] || continue
+    printf '\noutput "%s" {\n' "$name"
+    printf '  value      = local.found ? local.seed.%s : local.placeholder.%s\n' "$name" "$name"
+    [ "$sens" != 1 ] || printf '  sensitive  = true\n'
+    printf '  depends_on = [terraform_data.placeholder_guard]\n}\n'
+  done <<EOF
+$outs
+EOF
+}
+
+# tf:seed:new -- scaffold seed $1 in the stack: the reader, the seed module if there
+# is none yet, and the call and root output in seeds.tf if they are missing. Files
+# only; it touches no state and no cloud. The reader is specialised to the maker's
+# backend: the type is the label of the `backend "<type>"` block in the stack's *.tf,
+# and the settings come from variables/<maker>.backend.hcl, or from the .tf that
+# holds the block when the stack keeps its backend inline.
+tf_seed_new() {
+  local seed="${1:-}" stack="$V_STACK" root dir
+  root="${V_STACKS_DIR:-stacks}"
+  dir="$root/$stack"
+
+  case "$seed" in
+    ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*)
+      echo "SEED=$seed is not a usable seed name: letters, digits and _, not starting with a digit." >&2
+      echo "  task tf:seed:new STACK=$stack SEED=oauth_client" >&2
+      exit 1
+      ;;
+  esac
+  [ -d "$dir" ] || {
+    echo "stack '$stack' does not exist ($dir)." >&2
+    exit 1
+  }
+  if [ -e "$dir/seeds/$seed/read" ]; then
+    echo "$dir/seeds/$seed/read already exists; not overwriting it." >&2
+    echo "Delete it first if you want it scaffolded again." >&2
+    exit 1
+  fi
+
+  local f type="" mode inline hcl=""
+  for f in "$dir"/*.tf; do
+    [ -f "$f" ] || continue
+    type=$(_hcl_block backend "$f" | sed -n '1s/^backend[[:space:]]*"\([^"]*\)".*/\1/p')
+    if [ -n "$type" ]; then break; fi
+  done
+  if [ -z "$type" ]; then
+    echo "stack '$stack' has no backend \"<type>\" block in $dir/*.tf, so there is no state for a reader to read." >&2
+    exit 1
+  fi
+  case "$type" in
+    local|gcs) ;;
+    *)
+      echo "stack '$stack' keeps its state in a \"$type\" backend; seeds support local and gcs." >&2
+      exit 1
+      ;;
+  esac
+  inline=$(BACKEND_INLINE_FILE "$dir")
+  for f in "$dir"/variables/*.backend.hcl; do
+    if [ -f "$f" ]; then hcl=$f; break; fi
+  done
+  if [ -n "$hcl" ]; then
+    mode=config
+  elif [ -n "$inline" ]; then
+    mode=inline
+  else
+    echo "stack '$stack' has a \"$type\" backend block but no settings for it: no $dir/variables/*.backend.hcl," >&2
+    echo "and no backend block with bucket/path/prefix in a .tf. A reader needs them to find the state." >&2
+    exit 1
+  fi
+
+  local outs name made=""
+  if [ -d "$dir/seeds/$seed" ]; then
+    outs=$(_seeds_outputs "$dir/seeds/$seed")
+  else
+    outs=
+  fi
+  [ -n "$outs" ] || outs="example${TAB}0"
+  while IFS=$TAB read -r name _; do
+    case "$name" in
+      *[!A-Za-z0-9_]*)
+        echo "seed output \"$name\" is not a plain identifier (letters, digits, _); rename it." >&2
+        exit 1
+        ;;
+    esac
+  done <<EOF
+$outs
+EOF
+
+  if [ ! -d "$dir/seeds/$seed" ]; then
+    mkdir -p "$dir/seeds/$seed"
+    cat > "$dir/seeds/$seed/main.tf" <<EOF
+# Seed $seed of stack $stack: the resources that create the values other stacks read,
+# and one output per value. Keep it to what the readers need and let the rest of the
+# stack stay outside it. Every output here is mirrored in read/main.tf.
+
+output "example" {
+  value = "example"
+}
+EOF
+    made="$made  $dir/seeds/$seed/main.tf (stub: replace the example output)"$'\n'
+  fi
+
+  mkdir -p "$dir/seeds/$seed/read"
+  _seeds_reader "$stack" "$seed" "$type" "$mode" "$inline" "$outs" > "$dir/seeds/$seed/read/main.tf"
+  made="$made  $dir/seeds/$seed/read/main.tf (placeholders to make well-formed)"$'\n'
+
+  local calls rootouts add_call=1 add_out=1
+  calls=$(_seeds_calls "$dir" | awk -F'\t' -v x="$seed" '$1 == x { print $2 }')
+  [ -z "$calls" ] || add_call=0
+  rootouts=$(_seeds_outputs "$dir" | cut -f1)
+  if _seeds_has_line "$rootouts" "seed_$seed"; then add_out=0; fi
+  if [ "$add_call" = 1 ] || [ "$add_out" = 1 ]; then
+    local sf="$dir/seeds.tf"
+    if [ -s "$sf" ]; then
+      [ -z "$(tail -c 1 "$sf")" ] || echo >> "$sf"
+      echo >> "$sf"
+    fi
+    if [ "$add_call" = 1 ]; then
+      printf 'module "%s" {\n  source = "./seeds/%s"\n}\n' "$seed" "$seed" >> "$sf"
+      [ "$add_out" = 0 ] || echo >> "$sf"
+    fi
+    if [ "$add_out" = 1 ]; then
+      printf 'output "seed_%s" {\n  value     = module.%s\n  sensitive = true\n}\n' "$seed" "$seed" >> "$sf"
+    fi
+    made="$made  $sf (seed call and output, appended)"$'\n'
+  fi
+
+  echo "seed $stack.$seed:"
+  printf '%s' "$made"
+  echo "Next: write the seed's resources and outputs, make the placeholders realistic, then"
+  echo "  task tf:init:init STACK=$stack      # the new module call needs an init"
+  echo "  task tf:seeds:check"
+}
+
+# -- the two phases -----------------------------------------------------------------
+
+# SEED_TARGETS -- the -target flags that select a stack's seed calls, for the Taskfile
+# var of that name: `-target=module.<label>` for each, which also covers a call with
+# a count. Empty when the stack has none.
+SEED_TARGETS() {
+  local dir="$1" out="" x label
+  while IFS=$TAB read -r x label; do
+    [ -n "$x" ] || continue
+    out="$out${out:+ }-target=module.$label"
+  done <<EOF
+$(_seeds_calls "$dir")
+EOF
+  printf '%s' "$out"
+}
+
+# tf:seed:plan -- plan just the seed calls of the stack, saved to SEED_PLAN_FILE, and
+# say whether there is anything to apply. Runs in the stack directory, after the
+# same guards and init as tf:plan. tofu warns that -target is in use: expected.
+tf_seed_plan() {
+  if [ -z "$V_SEED_TARGETS" ]; then
+    echo "stack '$V_STACK' has no seed calls: no module with source \"./seeds/<seed>\" and a seeds/<seed>/ dir." >&2
+    echo "Scaffold one with: task tf:seed:new STACK=$V_STACK SEED=<name>" >&2
+    exit 1
+  fi
+  local rc=0
+  $V_TF plan $V__NO_COLOR $V__NO_LOCK $V_VAR_FILES $V_SEED_TARGETS -detailed-exitcode -out "$V_SEED_PLAN_FILE" || rc=$?
+  case "$rc" in
+    0) echo "seed plan: no changes ($V_STACK, VARS=$V_VARS_ID)" ;;
+    2) echo "seed plan: changes ($V_STACK, VARS=$V_VARS_ID): saved to $V_SEED_PLAN_FILE" ;;
+    *) exit "$rc" ;;
+  esac
+}
+
+# task -- `task` run from inside a task, for the fan-out loops: `scripts/tf-stack.sh task
+# tf:plan STACK=s VARS=v` from a Taskfile, plain `task ...` from this script (the function
+# shadows the binary here, so every nested call goes through it). Two things go wrong
+# with a bare nested `task`, and this fixes both:
+#
+# - Inherited values win. Task lets a variable already in the environment beat the callee's
+#   own `env:`, so the caller's V_STACK would turn STACK=s back into the caller's stack.
+#   Everything derived from STACK/VARS/BACKEND is cleared, so the callee works it out
+#   again: every V_* and TF_DATA_DIR (keyed by backend, see DATA_DIR in the Taskfile).
+# - Command-line vars are lost. A child process sees none of the caller's, so `task
+#   tf:plan:all TF=terraform` would plan every VARS id with tofu. The run-wide selectors
+#   in TASK_FORWARD are passed on as NAME=value from the caller's V_NAME, ahead of the
+#   caller's own arguments so an explicit one still wins (Task takes the last).
+#
+# Other inherited environment (TF_PLUGIN_CACHE_DIR, STACKS_DIR for org_tree) is left alone.
+# Outside a task, with no V_* set, this is plain `task`.
+TASK_FORWARD="TF TF_VERSION TMP STACKS_DIR NO_COLOR NO_LOCK PARALLEL BOOTSTRAP_PROJECT SECRETS_PROJECT SECRET_PREFIX SECRETS_DIR"
+
+task() {
+  local fwd=() unset=(-u TF_DATA_DIR) n vn
+  for n in $TASK_FORWARD; do
+    vn="V_$n"
+    [ -z "${!vn:-}" ] || fwd+=("$n=${!vn}")
+  done
+  for n in $(compgen -e); do
+    case "$n" in V_*) unset+=(-u "$n") ;; esac
+  done
+  if [ "$#" = 0 ]; then
+    env "${unset[@]}" task
+  else
+    env "${unset[@]}" task "$1" ${fwd[@]+"${fwd[@]}"} "${@:2}"
+  fi
+}
+
+# The VARS ids to run a stack under: the ones in VARS_MAP it has files for, else "" (its
+# default VARS), written as "@default" so it survives being a word.
+_seeds_vars_ids() {
+  local dir="$1" ids
+  ids=$(VARS_IDS_PRESENT "$dir" "$V_VARS_MAP")
+  [ -n "$ids" ] || ids=@default
+  printf '%s\n' $ids
+}
+
+# The repo-wide seed phase. Every maker stack, in seed order, under every VARS id it
+# has. plan: tf:seed:plan for each. apply: tf:seed:plan then, only when that found
+# changes, tf:seed:apply:ask -- so a stack whose seeds read another's is planned after
+# the other has applied, and sees real values rather than placeholders. Within one stack the
+# VARS ids run in map order; a seed that reads another VARS id of its own stack may
+# need a second run, and the guard keeps the first one safe.
+_seeds_loop() {
+  local mode="$1" root order s v vars
+  root="${V_STACKS_DIR:-stacks}"
+  order=$(tf_seeds_order) || exit 1
+  if [ -z "$order" ]; then
+    echo "no seeds under $root/*/seeds/"
+    return 0
+  fi
+  mkdir -p "$V_TMP"
+  _SEEDS_LOOP_OUT=$(mktemp "$V_TMP/seeds-loop.XXXXXX")
+  trap 'rm -f "$_SEEDS_LOOP_OUT"' EXIT
+  for s in $order; do
+    for v in $(_seeds_vars_ids "$root/$s"); do
+      vars=$v
+      [ "$v" != @default ] || vars=
+      echo "== $s ${vars:-(default VARS)}"
+      task tf:seed:plan STACK="$s" VARS="$vars" | tee "$_SEEDS_LOOP_OUT"
+      if [ "$mode" = apply ] && grep -q '^seed plan: changes' "$_SEEDS_LOOP_OUT"; then
+        task tf:seed:apply:ask STACK="$s" VARS="$vars"
+      fi
+    done
+  done
+}
+
+# tf:seeds:plan / tf:seeds:apply:ask -- see _seeds_loop.
+tf_seeds_plan() { _seeds_loop plan; }
+tf_seeds_apply() { _seeds_loop apply; }
+
+# -- deploy: every stack at once ------------------------------------------------------
+
+# The deploy units for a kind (plan or apply): "<run|skip>\t<stack>\t<vars id>" for
+# every stack and VARS id. An apply skips the stacks that are plan-only, which
+# tf:stack:assert would refuse.
+_deploy_units() {
+  local kind="$1" root s v id def file mode
+  root="${V_STACKS_DIR:-stacks}"
+  for s in $V_STACKS; do
+    for v in $(_seeds_vars_ids "$root/$s"); do
+      mode=run
+      if [ "$kind" = apply ]; then
+        id=$v
+        [ "$v" != @default ] || id=$s
+        def=$(BACKEND_DEFAULT "$root/$s" "$id")
+        file=$(BACKEND_FILE "$def")
+        [ "$(BACKEND_KIND "$root/$s/$file")" != none ] || mode=skip
+      fi
+      printf '%s\t%s\t%s\n' "$mode" "$s" "$v"
+    done
+  done
+}
+
+# One deploy unit, run by xargs: `task <task>` on a stack and VARS id with its own
+# output file, and the exit status beside it. Always exits 0: a failure is read from
+# the .rc file once every unit has finished, so one cannot stop the rest.
+_deploy_unit() {
+  local s="$1" v="$2" log="$3" task="$4" rc=0
+  [ "$v" != @default ] || v=
+  task "$task" STACK="$s" VARS="$v" >> "$log" 2>&1 || rc=$?
+  echo "$rc" > "${log%.log}.rc"
+  return 0
+}
+
+# The deploy phase: init every unit serially (the plugin cache is not safe under
+# concurrent init), run `task <task>` for all of them V_PARALLEL at a time, one log
+# per unit under TMP/deploy/, then print every log in full and a summary. Exits 1 if
+# any unit failed.
+_deploy_run() {
+  local kind="$1" task="$2" dir="$V_TMP/deploy" par="${V_PARALLEL:-4}"
+  case "$par" in ''|*[!0-9]*|0) echo "PARALLEL=$par must be a number of at least 1." >&2; exit 1 ;; esac
+  mkdir -p "$dir"
+  rm -f "$dir/$kind"-*
+  local units mode s v vars log args="$dir/$kind.args" failed=0 total=0
+  units=$(_deploy_units "$kind")
+  : > "$args"
+
+  while IFS=$TAB read -r mode s v; do
+    [ -n "$mode" ] || continue
+    if [ "$mode" = skip ]; then
+      echo "skip $s ${v#@default}: plan-only (no backend config), nothing to apply"
+      continue
+    fi
+    vars=$v
+    [ "$v" != @default ] || vars=
+    log="$dir/$kind-$s-${v#@}.log"
+    total=$((total + 1))
+    echo "init $s ${vars:-(default VARS)}"
+    : > "$log"
+    if task tf:init:once STACK="$s" VARS="$vars" >> "$log" 2>&1 < /dev/null; then
+      printf '%s\0%s\0%s\0%s\0' "$s" "$v" "$log" "$task" >> "$args"
+    else
+      echo "init failed" >> "$log"
+      echo 1 > "${log%.log}.rc"
+    fi
+  done <<EOF
+$units
+EOF
+
+  if [ -s "$args" ]; then
+    echo "$task: $total unit(s), $par at a time"
+    xargs -0 -n 4 -P "$par" bash "$0" _deploy_unit < "$args" || true
+  fi
+
+  local rc lines=""
+  while IFS=$TAB read -r mode s v; do
+    [ "$mode" = run ] || continue
+    log="$dir/$kind-$s-${v#@}.log"
+    rc=$(cat "${log%.log}.rc" 2>/dev/null || echo 1)
+    echo
+    if [ "$rc" = 0 ]; then
+      echo "==== $task STACK=$s VARS=${v#@default}: ok"
+    else
+      echo "==== $task STACK=$s VARS=${v#@default}: FAILED (exit $rc)"
+      failed=$((failed + 1))
+    fi
+    cat "$log"
+    lines="$lines$(printf '%-6s %s %s' "$([ "$rc" = 0 ] && echo ok || echo FAILED)" "$s" "${v#@default}")"$'\n'
+  done <<EOF
+$units
+EOF
+  rm -f "$args"
+
+  echo
+  echo "== $task summary: $((total - failed)) of $total ok"
+  printf '%s' "$lines"
+  [ "$failed" = 0 ] || exit 1
+}
+
+# tf:deploy:plan / tf:deploy:apply:ask -- see _deploy_run.
+tf_deploy_plan() { _deploy_run plan tf:plan; }
+tf_deploy_apply() { _deploy_run apply tf:apply:ask; }
 
 cmd="${1:-}"
 [ -n "$cmd" ] && shift || true
