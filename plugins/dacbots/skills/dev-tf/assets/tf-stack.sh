@@ -1464,7 +1464,6 @@ tf_secrets_pull() {
   done <<EOF
 $rows
 EOF
-  local total=$n
 
   if [ -s "$missing" ]; then
     echo "required secrets missing from $V_SECRETS_PROJECT, nothing written:" >&2
@@ -1531,6 +1530,41 @@ EOF
   _secrets_check_ignored "$(_secrets_norm "$tfvars")" || refused=1
   [ "$refused" = 0 ] || exit 1
 
+  # Each secret against what is here before anything is replaced: new (no local
+  # copy), updated, or unchanged. An inline secret compares the id@version the
+  # current tfvars header records; a file compares bytes, so an edited or deleted
+  # file counts as changed. Only changed files are rewritten, and the tfvars only
+  # when its bytes differ, so a pull that changes nothing writes nothing.
+  local st old
+  while IFS=$TAB read -r n var kind id dest tfvar ver; do
+    old=""
+    if [ "$kind" = inline ]; then
+      old=$(_secrets_local_version "$tfvars" "$id")
+      if ! _secrets_local_present "$var" "$kind" "$dest" "$tfvar"; then
+        st=new
+      elif [ "$old" != "$ver" ]; then
+        st=updated
+      else
+        st=unchanged
+      fi
+    else
+      path=$(_secrets_dest_path "$dest")
+      if [ ! -f "$path" ]; then
+        st=new
+      elif cmp -s "$_SECRETS_WORK/$n.out" "$path"; then
+        st=unchanged
+      else
+        st=updated
+      fi
+    fi
+    printf '%s' "$st" > "$_SECRETS_WORK/$n.status"
+    if [ "$st" = updated ] && [ -n "$old" ]; then
+      printf ' (was @%s)' "$old" > "$_SECRETS_WORK/$n.was"
+    else
+      : > "$_SECRETS_WORK/$n.was"
+    fi
+  done < "$entries"
+
   # Every parent dir first, so the one step that can fail on a bad path does so
   # before anything is replaced; then only renames.
   while IFS=$TAB read -r n path; do
@@ -1539,13 +1573,26 @@ EOF
   mkdir -p "$(dirname "$tfvars")"
   local wrote=""
   while IFS=$TAB read -r n path; do
+    [ "$(cat "$_SECRETS_WORK/$n.status")" != unchanged ] || continue
     mv -f "$_SECRETS_WORK/$n.out" "$path"
     wrote="$wrote  $path"$'\n'
   done < "$files"
-  mv -f "$staged" "$tfvars"
-  echo "pulled $(wc -l < "$entries" | tr -d ' ') of $total secrets from $V_SECRETS_PROJECT (VARS=$V_VARS_ID):"
-  echo "  $tfvars"
-  printf '%s' "$wrote"
+  if ! { [ -f "$tfvars" ] && cmp -s "$staged" "$tfvars"; }; then
+    mv -f "$staged" "$tfvars"
+    wrote="  $tfvars"$'\n'"$wrote"
+  fi
+
+  echo "secrets for $V_STACK (VARS=$V_VARS_ID) from $V_SECRETS_PROJECT:"
+  while IFS=$TAB read -r n var kind id dest tfvar ver; do
+    printf '  %-*s  %-9s  %s@%s%s\n' "$width" "$var" "$(cat "$_SECRETS_WORK/$n.status")" \
+      "$id" "$ver" "$(cat "$_SECRETS_WORK/$n.was")"
+  done < "$entries"
+  if [ -n "$wrote" ]; then
+    echo "wrote:"
+    printf '%s' "$wrote"
+  else
+    echo "up to date: nothing written."
+  fi
 }
 
 # tf:secrets:push:ask -- store one secret: create it, or add a version when it
