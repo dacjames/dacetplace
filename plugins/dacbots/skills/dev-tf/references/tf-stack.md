@@ -563,7 +563,7 @@ confirmed.
 | `tf:secrets:new:ask` | `ID=<var>` and optionally `FILE=<path>`. Create the secret, declare the variable (sensitive, ephemeral) in `secrets.tf` if it is not declared, then pull. Interactive |
 | `tf:secrets` | Report: the project, manifest and tfvars paths, then a row per secret with its kind, whether it is required, its id and destination (from the repo root), its latest version in the cloud (`CLOUD`) and whether it is here (`LOCAL`: `yes`, `no`, or `stale` when the cloud has a newer version than the one pulled) |
 | `tf:secrets:pull:ask` | Fetch every secret and write `dev.secret.tfvars` and the file secrets. All or nothing: nothing is written if a required secret is missing, a fetch fails, or a destination is not ignored. Optional secrets that do not exist are skipped with a note. Reports each secret as `new`, `updated` (with the version it replaced) or `unchanged`, and rewrites only what changed: an up-to-date pull writes nothing |
-| `tf:secrets:push:ask` | `VAR=<var>`, and optionally `FILE=<path>`. Store a secret: create it, or add a version if the bytes differ from the latest. The source is `FILE`, else a file secret's own path, else stdin |
+| `tf:secrets:push:ask` | `VAR=<var>`, and optionally `FILE=<path>`. Store a secret: create it, or add a version if the bytes differ from the latest or the latest is destroyed. The source is `FILE`, else a file secret's own path, else stdin |
 | `tf:secrets:assert` | Offline guard; fails if a required secret is not on this machine. Runs before every task whose tofu command evaluates the variables (see [The guards](#the-guards)) |
 
 An inline value goes in on stdin, byte for byte; use `printf`, not `echo`,

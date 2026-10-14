@@ -50,6 +50,20 @@ entries, 8 tokens).
 
 ---
 
+## 0.9.1 — push over a destroyed secret version
+
+- **Changes:** a secret whose latest version is destroyed counts as having no
+  value. `tf:secrets:push:ask` adds a new version to it (before: it failed with
+  `FAILED_PRECONDITION ... is in DESTROYED state`), `tf:secrets:pull:ask`
+  reports it missing and names the push command, and `tf:secrets:status` shows
+  `-` in CLOUD.
+- **Signature:** the same names and Taskfile as 0.9.0; the script contains
+  `value(name,state)`. Script blob
+  `83cf407c6085a55320c317f079127211b3799501`.
+- **Toolkit-owned surface:** nothing added, renamed or dropped.
+- **Replaces:** nothing.
+- **After updating:** none.
+
 ## 0.9.0 — seeds, two-phase deploy, nested task calls
 
 - **Changes:**

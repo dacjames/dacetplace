@@ -1104,11 +1104,16 @@ _secrets_not_found() {
 }
 
 # The latest version number of a secret, in _SECRETS_VERSION. Returns 3 when the
-# secret or any version of it is missing, 1 (stderr shown) on any other failure.
+# secret or any version of it is missing, or the latest version is destroyed (it
+# has no payload left, so there is no value), 1 (stderr shown) on any other failure.
 _secrets_latest() {
-  local id="$1" err="$_SECRETS_WORK/gcloud.err" name
-  if name=$(gcloud secrets versions describe latest --secret="$id" --project="$V_SECRETS_PROJECT" \
-              --format='value(name)' 2>"$err" </dev/null); then
+  local id="$1" err="$_SECRETS_WORK/gcloud.err" out name state
+  if out=$(gcloud secrets versions describe latest --secret="$id" --project="$V_SECRETS_PROJECT" \
+              --format='value(name,state)' 2>"$err" </dev/null); then
+    IFS=$TAB read -r name state <<EOF
+$out
+EOF
+    [ "$state" != DESTROYED ] || return 3
     _SECRETS_VERSION="${name##*/}"
     return 0
   fi
@@ -1596,8 +1601,9 @@ EOF
 }
 
 # tf:secrets:push:ask -- store one secret: create it, or add a version when it
-# exists and the bytes differ. The source is FILE if given, else a file-kind
-# secret's own destination, else stdin, taken byte for byte.
+# exists and the bytes differ or its latest version is destroyed. The source is
+# FILE if given, else a file-kind secret's own destination, else stdin, taken
+# byte for byte.
 tf_secrets_push() {
   local var="$1" file="${2:-}"
   [ -n "$var" ] || {
