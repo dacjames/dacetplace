@@ -50,6 +50,24 @@ entries, 8 tokens).
 
 ---
 
+## 0.9.2 — seed plans follow moves into a seed
+
+- **Changes:** `tf:seed:plan` (and so `tf:seeds:plan` and
+  `tf:seeds:apply:ask`) also targets the other side of every root `moved`
+  block that has one side inside a seed call. Lifting existing resources into
+  a new seed with `moved` now plans as a move (before: it failed with
+  `Moved resource instances excluded by targeting`).
+- **Signature:** the same names and Taskfile as 0.9.1; the script contains
+  `inseed(`. Script blob `ead0eab07cfa43fd6e24df0e3075dcb80d61cd98`.
+- **Toolkit-owned surface:** nothing added, renamed or dropped; the Seeds
+  section of `docs/tf-stack.md` gains "Moving existing resources into a
+  seed".
+- **Replaces:** a hand-run `tf:seed:plan -- -target=<old address>` or a
+  `SEED_TARGETS` override that adds moved-from addresses, found with `grep -n
+  SEED_TARGETS Taskfile.yml` outside the toolkit block. Both become plain
+  `tf:seed:plan`.
+- **After updating:** none.
+
 ## 0.9.1 — push over a destroyed secret version
 
 - **Changes:** a secret whose latest version is destroyed counts as having no

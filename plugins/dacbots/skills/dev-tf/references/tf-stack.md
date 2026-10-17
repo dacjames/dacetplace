@@ -674,6 +674,27 @@ writes a **placeholder** for each output, `"placeholder-<name>"`. Replace them w
 well-formed values (the real one where it is known in advance, like a client id). The reader's
 outputs must keep the seed's names and `sensitive` flags; `task tf:seeds:check` compares them.
 
+### Moving existing resources into a seed
+
+When the stack already has the resources, move them into the seed instead of creating new
+ones: write the seed as above, delete the resources from the stack's root, and add a `moved`
+block for each, also in the root. Anything else in the stack that used them now reads
+`module.oauth_client.<output>`.
+
+```hcl
+# stacks/portal/moved.tf
+moved {
+  from = google_iap_client.this
+  to   = module.oauth_client.google_iap_client.this
+}
+```
+
+A plan with `-target` must cover both sides of a move, or tofu refuses it ("Moved resource
+instances excluded by targeting"). So for every root `moved` block with one side inside a seed
+call, `tf:seed:plan` also targets the other side. The seed plan then shows `has moved to`,
+with nothing created or destroyed. Keep the blocks after the apply: by then the old addresses
+match nothing.
+
 ### Using a seed
 
 From another stack, call the reader and name the maker's backend id:
@@ -919,7 +940,7 @@ repo. See [Seeds](#seeds).
 | `tf:seeds:list` | Every seed: stack, call, root output, and the `stack:file` of each reader |
 | `tf:seeds:check` | Lint every seed and the seed order; exit 1 on a problem |
 | `tf:seed:new` | `SEED=<name>`. Scaffold the reader, the seed stub if the seed is new, and the call and output in `seeds.tf`. Files only, so no `:ask` |
-| `tf:seed:plan` | Plan only the stack's seed calls (`-target`), saved as `<plan file>.seed.tfplan` |
+| `tf:seed:plan` | Plan only the stack's seed calls (`-target`, plus the other side of a move into one), saved as `<plan file>.seed.tfplan` |
 | `tf:seed:apply:ask` | Apply that saved seed plan |
 | `tf:seeds:plan` | `tf:seed:plan` for every maker stack and `VARS` id, in seed order |
 | `tf:seeds:apply:ask` | For each of those: plan, and apply when there are changes |

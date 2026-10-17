@@ -2487,15 +2487,56 @@ EOF
 # SEED_TARGETS -- the -target flags that select a stack's seed calls, for the Taskfile
 # var of that name: `-target=module.<label>` for each, which also covers a call with
 # a count. Empty when the stack has none.
+#
+# A top-level `moved` block in the stack's root whose one side is inside a seed call and
+# whose other side is not -- how existing resources are lifted into a new seed -- adds a
+# target for the side outside: tofu refuses a targeted plan that covers only one side of
+# a move ("Moved resource instances excluded by targeting"). Once applied, the kept block's
+# old address matches nothing, and targeting it is harmless.
 SEED_TARGETS() {
-  local dir="$1" out="" x label
+  local dir="$1" out="" x label labels="" f moves
   while IFS=$TAB read -r x label; do
     [ -n "$x" ] || continue
     out="$out${out:+ }-target=module.$label"
+    labels="$labels${labels:+ }$label"
   done <<EOF
 $(_seeds_calls "$dir")
 EOF
-  printf '%s' "$out"
+  [ -n "$labels" ] || return 0
+  moves=$(for f in "$dir"/*.tf; do
+    [ -f "$f" ] || continue
+    _hcl_lines "$f"
+  done | awk -v labels="$labels" '
+    function inseed(a,   m, c) {
+      for (m in seed) {
+        if (index(a, "module." m) != 1) continue
+        c = substr(a, length("module." m) + 1, 1)
+        if (c == "" || c == "." || c == "[") return 1
+      }
+      return 0
+    }
+    function addr(s) {
+      sub(/^[a-z]+[ \t]*=[ \t]*/, "", s)
+      sub(/[ \t]+(#|\/\/).*$/, "", s)
+      sub(/[ \t]+$/, "", s)
+      return s
+    }
+    BEGIN { n = split(labels, l, " "); for (i = 1; i <= n; i++) seed[l[i]] = 1 }
+    {
+      t = $0
+      gsub(/"[^"]*"/, "", t)
+      if (depth == 0 && $0 ~ /^moved[ \t]*[{]/) { mv = 1; from = ""; to = "" }
+      else if (mv && depth == 1 && $0 ~ /^from[ \t]*=/) from = addr($0)
+      else if (mv && depth == 1 && $0 ~ /^to[ \t]*=/) to = addr($0)
+      depth += gsub(/[{]/, "&", t) - gsub(/[}]/, "&", t)
+      if (depth <= 0) {
+        depth = 0
+        if (mv && from != "" && to != "" && inseed(from) != inseed(to)) res = res " -target=" (inseed(to) ? from : to)
+        mv = 0
+      }
+    }
+    END { printf "%s", res }')
+  printf '%s' "$out$moves"
 }
 
 # tf:seed:plan -- plan just the seed calls of the stack, saved to SEED_PLAN_FILE, and
